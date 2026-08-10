@@ -7,6 +7,18 @@ Workspace templates are ordinary Zellij KDL with MiniJinja placeholders. They
 are discovered and rendered at runtime, so adding or editing one never
 requires rebuilding the runner or plugin.
 
+## Screenshots
+
+The responsive workspace dashboard keeps sessions visible in the left sidebar,
+tabs along the bottom, and the rest of the terminal available for real work:
+
+![A Zellij workspace with a session sidebar, editor and checks panes, and a compact bottom tab bar](docs/images/workspace-dashboard.png)
+
+Workspace layouts are discovered from the templates directory at runtime, so
+the creation flow immediately offers new or edited templates:
+
+![The runtime workspace template selector offering default, development, and services layouts](docs/images/template-selector.png)
+
 ## Build and install
 
 Requirements: stable Rust, Zellij, and the `wasm32-wasip1` Rust target.
