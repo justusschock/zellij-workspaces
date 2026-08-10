@@ -6,7 +6,7 @@ use std::{
 };
 
 use crossterm::{
-    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyModifiers},
+    event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode},
     execute,
     terminal::{self, EnterAlternateScreen, LeaveAlternateScreen},
 };
@@ -21,7 +21,15 @@ use tui::{
 };
 use unicode_width::UnicodeWidthStr;
 
-use crate::{action::Action, dir::Dir, log, options::OPTIONS, template::TemplateEngine, zellij};
+use crate::{
+    action::Action,
+    dir::Dir,
+    keymap::{Keymaps, PickerAction},
+    log,
+    options::OPTIONS,
+    template::TemplateEngine,
+    zellij,
+};
 
 pub(crate) fn action_selector(sessions: zellij::Sessions) -> Action {
     let screen = ActionSelectorScreen::new(sessions.clone());
@@ -51,6 +59,7 @@ struct UIContext<'a> {
     cwd: Dir,
     sessions: zellij::Sessions,
     banner: Option<Banner<'a>>,
+    keymaps: Keymaps,
 }
 
 enum ScreenResult {
@@ -60,12 +69,22 @@ enum ScreenResult {
 
 impl<'a> UI<'a> {
     pub(crate) fn render(screen: Box<dyn Screen>, sessions: zellij::Sessions) -> Action {
+        let keymaps = match Keymaps::load(&OPTIONS.keymaps) {
+            Ok(keymaps) => keymaps,
+            Err(error) => {
+                return Action::Exit(Err(io::Error::new(
+                    error.kind(),
+                    format!("Failed to load {}: {error}", OPTIONS.keymaps.display()),
+                )));
+            }
+        };
         let mut ui = Self {
             screen,
             context: UIContext {
                 cwd: Dir::cwd(),
                 sessions,
                 banner: BANNERS.random(),
+                keymaps,
             },
         };
 
@@ -438,26 +457,26 @@ where
         Ok(())
     }
 
-    fn listen(&mut self) -> io::Result<EventResult> {
+    fn listen(&mut self, ctx: &UIContext) -> io::Result<EventResult> {
         if let Event::Key(key) = event::read()? {
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(EventResult::Exit),
-                (KeyCode::Char('y'), _) => {
+            match ctx.keymaps.picker.action(&key) {
+                Some(PickerAction::Quit) => return Ok(EventResult::Exit),
+                Some(PickerAction::Yes) => {
                     self.selector.select(true);
                     return Ok(EventResult::Return);
                 }
-                (KeyCode::Char('n'), _) => {
+                Some(PickerAction::No) => {
                     self.selector.select(false);
                     return Ok(EventResult::Return);
                 }
-                (KeyCode::Down, _) => {
+                Some(PickerAction::Down) => {
                     self.selector.next();
                 }
-                (KeyCode::Up, _) => {
+                Some(PickerAction::Up) => {
                     self.selector.previous();
                 }
-                (KeyCode::Enter, _) => return Ok(EventResult::Return),
-                (KeyCode::Esc, _) => return Ok(EventResult::Cancel),
+                Some(PickerAction::Accept) => return Ok(EventResult::Return),
+                Some(PickerAction::Cancel) => return Ok(EventResult::Cancel),
                 _ => (),
             }
         }
@@ -473,7 +492,7 @@ where
     fn render(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<ScreenResult> {
         loop {
             self.draw(term, ctx)?;
-            match self.listen()? {
+            match self.listen(ctx)? {
                 EventResult::Continue => (),
                 EventResult::Return => {
                     match self.selector.flush() {
@@ -713,32 +732,30 @@ impl<'a> ActionSelectorScreen<'a> {
 
     fn listen(&mut self, ctx: &UIContext) -> io::Result<EventResult> {
         if let Event::Key(key) = event::read()? {
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(EventResult::Exit),
-                (KeyCode::Char('n'), KeyModifiers::CONTROL) => {
+            match ctx.keymaps.picker.action(&key) {
+                Some(PickerAction::Quit) => return Ok(EventResult::Exit),
+                Some(PickerAction::NewWorkspace) => {
                     self.selector.select_by(|value| match value {
                         ActionSelectorItem::NewSession { input: _ } => true,
                         ActionSelectorItem::Session { .. } | ActionSelectorItem::Exit => false,
                     });
                     return Ok(EventResult::Return);
                 }
-                (KeyCode::Char(char), _) => {
-                    self.input.insert(char);
-                    self.filter(ctx);
-                }
-                (KeyCode::Backspace, _) => {
-                    self.input.delete();
-                    self.filter(ctx);
-                }
-                (KeyCode::Down, _) => {
-                    self.selector.next();
-                }
-                (KeyCode::Up, _) => {
-                    self.selector.previous();
-                }
-                (KeyCode::Enter, _) => return Ok(EventResult::Return),
-                (KeyCode::Esc, _) => return Ok(EventResult::Exit),
-                _ => (),
+                Some(PickerAction::Down) => self.selector.next(),
+                Some(PickerAction::Up) => self.selector.previous(),
+                Some(PickerAction::Accept) => return Ok(EventResult::Return),
+                Some(PickerAction::Cancel) => return Ok(EventResult::Exit),
+                None | Some(PickerAction::Yes | PickerAction::No) => match key.code {
+                    KeyCode::Char(char) => {
+                        self.input.insert(char);
+                        self.filter(ctx);
+                    }
+                    KeyCode::Backspace => {
+                        self.input.delete();
+                        self.filter(ctx);
+                    }
+                    _ => (),
+                },
             }
         }
 
@@ -904,27 +921,27 @@ impl<'a> DirSelectorScreen<'a> {
         Ok(())
     }
 
-    fn listen(&mut self) -> io::Result<EventResult> {
+    fn listen(&mut self, ctx: &UIContext) -> io::Result<EventResult> {
         if let Event::Key(key) = event::read()? {
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(EventResult::Exit),
-                (KeyCode::Char(char), _) => {
-                    self.input.insert(char);
-                    self.filter();
+            match ctx.keymaps.picker.action(&key) {
+                Some(PickerAction::Quit) => return Ok(EventResult::Exit),
+                Some(PickerAction::Down) => self.selector.next(),
+                Some(PickerAction::Up) => self.selector.previous(),
+                Some(PickerAction::Accept) => return Ok(EventResult::Return),
+                Some(PickerAction::Cancel) => return Ok(EventResult::Cancel),
+                None | Some(PickerAction::NewWorkspace | PickerAction::Yes | PickerAction::No) => {
+                    match key.code {
+                        KeyCode::Char(char) => {
+                            self.input.insert(char);
+                            self.filter();
+                        }
+                        KeyCode::Backspace => {
+                            self.input.delete();
+                            self.filter();
+                        }
+                        _ => (),
+                    }
                 }
-                (KeyCode::Backspace, _) => {
-                    self.input.delete();
-                    self.filter();
-                }
-                (KeyCode::Down, _) => {
-                    self.selector.next();
-                }
-                (KeyCode::Up, _) => {
-                    self.selector.previous();
-                }
-                (KeyCode::Enter, _) => return Ok(EventResult::Return),
-                (KeyCode::Esc, _) => return Ok(EventResult::Cancel),
-                _ => (),
             }
         }
 
@@ -960,7 +977,7 @@ impl<'a> Screen for DirSelectorScreen<'a> {
     fn render(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<ScreenResult> {
         loop {
             self.draw(term, ctx)?;
-            match self.listen()? {
+            match self.listen(ctx)? {
                 EventResult::Continue => (),
                 EventResult::Return => {
                     match self.selector.flush() {
@@ -1033,19 +1050,24 @@ impl SessionNameScreen {
         Ok(())
     }
 
-    fn listen(&mut self) -> io::Result<EventResult> {
+    fn listen(&mut self, ctx: &UIContext) -> io::Result<EventResult> {
         if let Event::Key(key) = event::read()? {
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(EventResult::Exit),
-                (KeyCode::Char(char), _) => {
-                    self.input.insert(char);
-                }
-                (KeyCode::Backspace, _) => {
-                    self.input.delete();
-                }
-                (KeyCode::Enter, _) => return Ok(EventResult::Return),
-                (KeyCode::Esc, _) => return Ok(EventResult::Cancel),
-                _ => (),
+            match ctx.keymaps.picker.action(&key) {
+                Some(PickerAction::Quit) => return Ok(EventResult::Exit),
+                Some(PickerAction::Accept) => return Ok(EventResult::Return),
+                Some(PickerAction::Cancel) => return Ok(EventResult::Cancel),
+                None
+                | Some(
+                    PickerAction::Up
+                    | PickerAction::Down
+                    | PickerAction::NewWorkspace
+                    | PickerAction::Yes
+                    | PickerAction::No,
+                ) => match key.code {
+                    KeyCode::Char(char) => self.input.insert(char),
+                    KeyCode::Backspace => self.input.delete(),
+                    _ => (),
+                },
             }
         }
 
@@ -1057,7 +1079,7 @@ impl Screen for SessionNameScreen {
     fn render(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<ScreenResult> {
         loop {
             self.draw(term, ctx)?;
-            match self.listen()? {
+            match self.listen(ctx)? {
                 EventResult::Continue => (),
                 EventResult::Return => {
                     match self.input.value.as_str() {
@@ -1204,27 +1226,27 @@ impl TemplateSelectorScreen {
         Ok(())
     }
 
-    fn listen(&mut self) -> io::Result<EventResult> {
+    fn listen(&mut self, ctx: &UIContext) -> io::Result<EventResult> {
         if let Event::Key(key) = event::read()? {
-            match (key.code, key.modifiers) {
-                (KeyCode::Char('c'), KeyModifiers::CONTROL) => return Ok(EventResult::Exit),
-                (KeyCode::Char(char), _) => {
-                    self.input.insert(char);
-                    self.filter();
+            match ctx.keymaps.picker.action(&key) {
+                Some(PickerAction::Quit) => return Ok(EventResult::Exit),
+                Some(PickerAction::Down) => self.selector.next(),
+                Some(PickerAction::Up) => self.selector.previous(),
+                Some(PickerAction::Accept) => return Ok(EventResult::Return),
+                Some(PickerAction::Cancel) => return Ok(EventResult::Exit),
+                None | Some(PickerAction::NewWorkspace | PickerAction::Yes | PickerAction::No) => {
+                    match key.code {
+                        KeyCode::Char(char) => {
+                            self.input.insert(char);
+                            self.filter();
+                        }
+                        KeyCode::Backspace => {
+                            self.input.delete();
+                            self.filter();
+                        }
+                        _ => (),
+                    }
                 }
-                (KeyCode::Backspace, _) => {
-                    self.input.delete();
-                    self.filter();
-                }
-                (KeyCode::Down, _) => {
-                    self.selector.next();
-                }
-                (KeyCode::Up, _) => {
-                    self.selector.previous();
-                }
-                (KeyCode::Enter, _) => return Ok(EventResult::Return),
-                (KeyCode::Esc, _) => return Ok(EventResult::Exit),
-                _ => (),
             }
         }
 
@@ -1256,7 +1278,7 @@ impl Screen for TemplateSelectorScreen {
     fn render(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<ScreenResult> {
         loop {
             self.draw(term, ctx)?;
-            match self.listen()? {
+            match self.listen(ctx)? {
                 EventResult::Continue => (),
                 EventResult::Return => {
                     match self.selector.flush() {

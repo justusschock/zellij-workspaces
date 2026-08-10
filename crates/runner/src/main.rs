@@ -7,6 +7,7 @@
 
 mod action;
 mod dir;
+mod keymap;
 mod log;
 mod options;
 mod runner;
