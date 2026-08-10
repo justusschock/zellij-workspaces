@@ -1,0 +1,24 @@
+layout {
+    default_tab_template {
+        pane split_direction="vertical" {
+            pane size=18 borderless=true {
+                plugin location="session-ui" { view "sidebar"; }
+            }
+            pane { children; }
+        }
+        pane size=1 borderless=true {
+            plugin location="session-ui" { view "statusbar"; }
+        }
+    }
+
+    tab name="{{ workspace.name | kdl }}" focus=true cwd="{{ workspace.cwd | kdl }}" {
+        pane split_direction="vertical" {
+            pane name="service" size="70%" command="{{ tools.shell | kdl }}" close_on_exit=false {
+                args "-lc" "{{ vars.SERVICE | default('printf \\\"Set ZELLIJ_WORKSPACES_VAR_SERVICE to start a service.\\\\n\\\"; exec $SHELL') | kdl }}"
+            }
+            pane name="logs" size="30%" command="{{ tools.shell | kdl }}" close_on_exit=false {
+                args "-lc" "{{ vars.LOGS | default('printf \\\"Set ZELLIJ_WORKSPACES_VAR_LOGS to follow logs.\\\\n\\\"; exec $SHELL') | kdl }}"
+            }
+        }
+    }
+}

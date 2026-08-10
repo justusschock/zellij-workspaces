@@ -1,0 +1,17 @@
+[workspace]
+members = ["crates/runner", "crates/session-ui"]
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+repository = "https://github.com/justusschock/zellij-workspaces"
+authors = ["Justus Perillieux <justus@perillieux.com>"]
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }

@@ -1,0 +1,674 @@
+mod color;
+mod datetime;
+mod model;
+mod session;
+mod sidebar;
+mod statusbar;
+mod tabs;
+mod view;
+
+use std::{
+    cmp::{max, min},
+    collections::BTreeMap,
+    path::PathBuf,
+};
+
+use zellij_tile::prelude::*;
+use zellij_tile_utils::style;
+
+use crate::{
+    datetime::DateTime,
+    model::{SidebarRow, dashboard_rows, is_wide, unread_count},
+    session::Session,
+    sidebar::{move_selection, row_for_screen_line},
+    statusbar::{select_visible_tabs, truncate_to_width},
+    tabs::Tabs,
+    view::Bg,
+};
+
+const SIDEBAR_REFRESH_SECONDS: f64 = 5.0;
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PluginView {
+    #[default]
+    Statusbar,
+    Sidebar,
+}
+
+#[derive(Default)]
+struct State {
+    view: PluginView,
+    tabs: Vec<TabInfo>,
+    active_tab_idx: usize,
+    mode_info: ModeInfo,
+    mouse_click_pos: usize,
+    should_change_tab: bool,
+    now: DateTime,
+    sessions: SessionListSnapshot,
+    client_id: ClientId,
+    plugin_id: u32,
+    initial_cwd: PathBuf,
+    pane_manifest: PaneManifest,
+    sidebar_selected: usize,
+    sidebar_first_row: usize,
+    sidebar_visible_rows: usize,
+    sidebar_visible: bool,
+    sidebar_wide: Option<bool>,
+    permissions_granted: bool,
+    permission_error: Option<String>,
+}
+
+register_plugin!(State);
+
+fn host_hide_self() {
+    #[cfg(target_family = "wasm")]
+    hide_self();
+}
+
+fn host_show_self(should_float_if_hidden: bool) {
+    #[cfg(target_family = "wasm")]
+    show_self(should_float_if_hidden);
+    #[cfg(not(target_family = "wasm"))]
+    let _ = should_float_if_hidden;
+}
+
+fn host_move_focus_right() {
+    #[cfg(target_family = "wasm")]
+    move_focus(Direction::Right);
+}
+
+fn host_switch_session(name: &str, tab_position: Option<usize>, pane_id: Option<(u32, bool)>) {
+    #[cfg(target_family = "wasm")]
+    switch_session_with_focus(name, tab_position, pane_id);
+    #[cfg(not(target_family = "wasm"))]
+    let _ = (name, tab_position, pane_id);
+}
+
+#[cfg(any(target_family = "wasm", test))]
+fn open_workspace_picker_with<Open, Show>(
+    initial_cwd: &std::path::Path,
+    open_pane: Open,
+    show_pane: Show,
+) where
+    Open: FnOnce(
+        CommandToRun,
+        Option<FloatingPaneCoordinates>,
+        BTreeMap<String, String>,
+    ) -> Option<PaneId>,
+    Show: FnOnce(PaneId, bool, bool),
+{
+    let mut command = CommandToRun::new("zellij-workspaces");
+    command.args.push("--new".into());
+    command.cwd = Some(initial_cwd.to_path_buf());
+    let coordinates = FloatingPaneCoordinates::new(
+        Some("10%".into()),
+        Some("9%".into()),
+        Some("80%".into()),
+        Some("82%".into()),
+        Some(false),
+        Some(false),
+    );
+    if let Some(pane_id) = open_pane(command, coordinates, BTreeMap::new()) {
+        show_pane(pane_id, true, true);
+    }
+}
+
+fn host_open_workspace_picker(initial_cwd: &std::path::Path) {
+    #[cfg(target_family = "wasm")]
+    open_workspace_picker_with(
+        initial_cwd,
+        open_command_pane_floating_near_plugin,
+        show_pane_with_id,
+    );
+    #[cfg(not(target_family = "wasm"))]
+    let _ = initial_cwd;
+}
+
+fn plugin_permissions() -> Vec<PermissionType> {
+    vec![
+        PermissionType::ReadApplicationState,
+        PermissionType::ChangeApplicationState,
+        PermissionType::RunCommands,
+    ]
+}
+
+fn statusbar_events() -> Vec<EventType> {
+    vec![
+        EventType::PermissionRequestResult,
+        EventType::TabUpdate,
+        EventType::ModeUpdate,
+        EventType::Mouse,
+        EventType::Timer,
+    ]
+}
+
+fn sidebar_events() -> Vec<EventType> {
+    vec![
+        EventType::PermissionRequestResult,
+        EventType::TabUpdate,
+        EventType::ModeUpdate,
+        EventType::PaneUpdate,
+        EventType::SessionUpdate,
+        EventType::Key,
+        EventType::Mouse,
+        EventType::Timer,
+        EventType::Visible,
+    ]
+}
+
+impl ZellijPlugin for State {
+    fn load(&mut self, configuration: BTreeMap<String, String>) {
+        self.view = match configuration.get("view").map(String::as_str) {
+            Some("sidebar") => PluginView::Sidebar,
+            _ => PluginView::Statusbar,
+        };
+        let plugin_ids = get_plugin_ids();
+        self.client_id = plugin_ids.client_id;
+        self.plugin_id = plugin_ids.plugin_id;
+        self.initial_cwd = plugin_ids.initial_cwd;
+        self.sidebar_visible = true;
+
+        let permissions = plugin_permissions();
+        request_permission(&permissions);
+
+        set_selectable(true);
+        match self.view {
+            PluginView::Statusbar => {
+                set_timeout(1.0);
+                subscribe(&statusbar_events());
+            }
+            PluginView::Sidebar => {
+                subscribe(&sidebar_events());
+            }
+        }
+    }
+
+    fn update(&mut self, event: Event) -> bool {
+        let mut should_render = false;
+
+        match event {
+            Event::PermissionRequestResult(status) => match status {
+                PermissionStatus::Granted => {
+                    self.permissions_granted = true;
+                    self.permission_error = None;
+                    if self.view == PluginView::Statusbar {
+                        set_selectable(false);
+                    } else {
+                        if let Ok(snapshot) = get_session_list() {
+                            self.sessions = snapshot;
+                            self.clamp_sidebar_selection();
+                        }
+                        set_timeout(SIDEBAR_REFRESH_SECONDS);
+                        if let Some(columns) = self
+                            .tabs
+                            .iter()
+                            .find(|tab| tab.active)
+                            .map(|tab| tab.display_area_columns)
+                        {
+                            self.update_sidebar_width(columns);
+                        }
+                        should_render = true;
+                    }
+                }
+                PermissionStatus::Denied => {
+                    self.permissions_granted = false;
+                    self.permission_error = Some(" Zellij permissions required".to_owned());
+                    should_render = true;
+                }
+            },
+            Event::ModeUpdate(mode_info) => {
+                should_render = self.mode_info != mode_info;
+                self.mode_info = mode_info;
+            }
+            Event::TabUpdate(tabs) => {
+                if let Some(active_tab_index) = tabs.iter().position(|t| t.active) {
+                    // tabs are indexed starting from 1 so we need to add 1
+                    let active_tab_idx = active_tab_index + 1;
+
+                    should_render = self.active_tab_idx != active_tab_idx || self.tabs != tabs;
+                    self.active_tab_idx = active_tab_idx;
+                    if self.view == PluginView::Sidebar && self.permissions_granted {
+                        self.update_sidebar_width(tabs[active_tab_index].display_area_columns);
+                    }
+                    self.tabs = tabs;
+                } else {
+                    eprintln!("Could not find active tab.");
+                }
+            }
+            Event::PaneUpdate(pane_manifest) if self.view == PluginView::Sidebar => {
+                should_render = self.pane_manifest != pane_manifest;
+                self.pane_manifest = pane_manifest;
+            }
+            Event::SessionUpdate(live_sessions, resurrectable_sessions)
+                if self.view == PluginView::Sidebar =>
+            {
+                self.sessions = SessionListSnapshot {
+                    live_sessions,
+                    resurrectable_sessions,
+                };
+                self.clamp_sidebar_selection();
+                should_render = true;
+            }
+            Event::Visible(visible) if self.view == PluginView::Sidebar => {
+                should_render = self.sidebar_visible != visible;
+                self.sidebar_visible = visible;
+            }
+            Event::Key(key) if self.view == PluginView::Sidebar => {
+                should_render = self.handle_sidebar_key(key);
+            }
+            Event::Mouse(event) => {
+                if self.view == PluginView::Sidebar {
+                    should_render = self.handle_sidebar_mouse(event);
+                } else {
+                    match event {
+                        Mouse::LeftClick(_, col) => {
+                            if self.mouse_click_pos != col {
+                                should_render = true;
+                                self.should_change_tab = true;
+                            }
+                            self.mouse_click_pos = col;
+                        }
+                        Mouse::ScrollUp(_) => {
+                            should_render = true;
+                            switch_tab_to(min(self.active_tab_idx + 1, self.tabs.len()) as u32);
+                        }
+                        Mouse::ScrollDown(_) => {
+                            should_render = true;
+                            switch_tab_to(max(self.active_tab_idx.saturating_sub(1), 1) as u32);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Event::Timer(_) => {
+                if self.view == PluginView::Statusbar {
+                    let now = DateTime::now();
+                    should_render = now != self.now;
+                    self.now = now;
+                    set_timeout(1.0);
+                } else if self.permissions_granted {
+                    if let Ok(snapshot) = get_session_list() {
+                        should_render = self.sessions != snapshot;
+                        self.sessions = snapshot;
+                        self.clamp_sidebar_selection();
+                    }
+                    set_timeout(SIDEBAR_REFRESH_SECONDS);
+                }
+            }
+            _ => {
+                eprintln!("Unexpected event: {:?}", event);
+            }
+        };
+
+        should_render
+    }
+
+    fn pipe(&mut self, message: PipeMessage) -> bool {
+        if self.view != PluginView::Sidebar
+            || message.name != "toggle_sessions"
+            || !self.sidebar_is_on_active_tab()
+        {
+            return false;
+        }
+
+        if self.sidebar_wide == Some(true) {
+            if self.sidebar_is_focused() {
+                host_move_focus_right();
+            } else {
+                host_show_self(false);
+                self.sidebar_visible = true;
+            }
+        } else if self.sidebar_visible {
+            host_hide_self();
+            self.sidebar_visible = false;
+        } else {
+            host_show_self(true);
+            self.sidebar_visible = true;
+        }
+        true
+    }
+
+    fn render(&mut self, rows: usize, cols: usize) {
+        if self.view == PluginView::Sidebar {
+            if let Some(message) = &self.permission_error {
+                let width = unicode_width::UnicodeWidthStr::width(message.as_str());
+                let line = format!("{}{}", message, " ".repeat(cols.saturating_sub(width)));
+                let palette = color::palette_from_styling(self.mode_info.style.colors);
+                print!("{}", style!(palette.red, palette.bg).bold().paint(line));
+                return;
+            }
+            let dashboard_rows = dashboard_rows(&self.sessions, self.client_id);
+            self.sidebar_selected = move_selection(self.sidebar_selected, 0, dashboard_rows.len());
+            let palette = color::palette_from_styling(self.mode_info.style.colors);
+            let (rendered, first_row) =
+                sidebar::render(&dashboard_rows, self.sidebar_selected, rows, cols, palette);
+            self.sidebar_first_row = first_row;
+            self.sidebar_visible_rows = rows.saturating_sub(2).min(dashboard_rows.len());
+            print!("{rendered}");
+            return;
+        }
+
+        self.render_statusbar(cols);
+    }
+}
+
+impl State {
+    fn sidebar_rows(&self) -> Vec<SidebarRow> {
+        dashboard_rows(&self.sessions, self.client_id)
+    }
+
+    fn clamp_sidebar_selection(&mut self) {
+        self.sidebar_selected = move_selection(self.sidebar_selected, 0, self.sidebar_rows().len());
+    }
+
+    fn sidebar_is_focused(&self) -> bool {
+        self.pane_manifest
+            .panes
+            .values()
+            .flatten()
+            .any(|pane| pane.is_plugin && pane.id == self.plugin_id && pane.is_focused)
+    }
+
+    fn sidebar_is_on_active_tab(&self) -> bool {
+        let Some(active_tab_position) = self
+            .tabs
+            .iter()
+            .find(|tab| tab.active)
+            .map(|tab| tab.position)
+        else {
+            return false;
+        };
+        self.pane_manifest
+            .panes
+            .get(&active_tab_position)
+            .is_some_and(|panes| {
+                panes
+                    .iter()
+                    .any(|pane| pane.is_plugin && pane.id == self.plugin_id)
+            })
+    }
+
+    fn update_sidebar_width(&mut self, display_area_columns: usize) {
+        let wide = is_wide(display_area_columns);
+        if self.sidebar_wide == Some(wide) {
+            return;
+        }
+        self.sidebar_wide = Some(wide);
+
+        if wide {
+            if !self.sidebar_visible {
+                host_show_self(false);
+                self.sidebar_visible = true;
+            }
+        } else if self.sidebar_visible {
+            host_hide_self();
+            self.sidebar_visible = false;
+        }
+    }
+
+    fn handle_sidebar_key(&mut self, key: KeyWithModifier) -> bool {
+        if !key.key_modifiers.is_empty() {
+            return false;
+        }
+
+        match key.bare_key {
+            BareKey::Char('j') | BareKey::Down => {
+                self.sidebar_selected =
+                    move_selection(self.sidebar_selected, 1, self.sidebar_rows().len());
+                true
+            }
+            BareKey::Char('k') | BareKey::Up => {
+                self.sidebar_selected =
+                    move_selection(self.sidebar_selected, -1, self.sidebar_rows().len());
+                true
+            }
+            BareKey::Enter => self.activate_sidebar_selection(),
+            BareKey::Char('n') => {
+                self.open_workspace_picker();
+                true
+            }
+            BareKey::Esc => {
+                self.leave_sidebar();
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn handle_sidebar_mouse(&mut self, event: Mouse) -> bool {
+        match event {
+            Mouse::LeftClick(screen_line, _) => {
+                let Some(visible_index) =
+                    row_for_screen_line(screen_line, self.sidebar_visible_rows)
+                else {
+                    return false;
+                };
+                self.sidebar_selected = self.sidebar_first_row + visible_index;
+                self.activate_sidebar_selection()
+            }
+            Mouse::ScrollUp(_) => {
+                self.sidebar_selected =
+                    move_selection(self.sidebar_selected, -1, self.sidebar_rows().len());
+                true
+            }
+            Mouse::ScrollDown(_) => {
+                self.sidebar_selected =
+                    move_selection(self.sidebar_selected, 1, self.sidebar_rows().len());
+                true
+            }
+            _ => false,
+        }
+    }
+
+    fn activate_sidebar_selection(&mut self) -> bool {
+        let Some(row) = self.sidebar_rows().get(self.sidebar_selected).cloned() else {
+            return false;
+        };
+
+        match row {
+            SidebarRow::Live(session) => {
+                host_switch_session(
+                    &session.name,
+                    session.focus.tab_position,
+                    session.focus.pane_id,
+                );
+            }
+            SidebarRow::NewWorkspace => self.open_workspace_picker(),
+        }
+        true
+    }
+
+    fn open_workspace_picker(&self) {
+        host_open_workspace_picker(&self.initial_cwd);
+    }
+
+    fn leave_sidebar(&mut self) {
+        if self.sidebar_wide == Some(true) {
+            host_move_focus_right();
+        } else {
+            host_hide_self();
+            self.sidebar_visible = false;
+        }
+    }
+
+    fn render_statusbar(&mut self, cols: usize) {
+        if self.tabs.is_empty() || cols == 0 {
+            return;
+        }
+
+        let session_name = &self.mode_info.session_name;
+        let mode = self.mode_info.mode;
+        let palette = color::palette_from_styling(self.mode_info.style.colors);
+        let unread = unread_count(&self.tabs);
+        let session_unread = if is_wide(cols) { 0 } else { unread };
+
+        let mut session = Session::render(session_name.as_deref(), mode, palette, session_unread);
+        let mut datetime = self.now.render(mode, palette);
+        let pad = Bg::render(2, palette);
+        let fixed_width = session.len + datetime.len + (pad.len * 2);
+
+        if fixed_width >= cols {
+            let unread_label = if unread == 0 {
+                String::new()
+            } else {
+                format!(" ●{unread}")
+            };
+            let label = format!(
+                " {}{} ",
+                session_name.as_deref().unwrap_or("Zellij"),
+                unread_label
+            );
+            let label = truncate_to_width(&label, cols);
+            let label_width = unicode_width::UnicodeWidthStr::width(label.as_str());
+            let text = format!("{}{}", label, " ".repeat(cols.saturating_sub(label_width)));
+            print!("{}", style!(palette.fg, palette.bg).bold().paint(text));
+            return;
+        }
+
+        let tab_widths = Tabs::widths(&self.tabs, mode);
+        let active_index = self.tabs.iter().position(|tab| tab.active).unwrap_or(0);
+        let visible = select_visible_tabs(&tab_widths, active_index, cols - fixed_width);
+        let mut tabs = Tabs::render_indices(&self.tabs, &visible.indices, mode, palette);
+        let omitted = visible.omitted.then(|| Tabs::omission(palette));
+        let omitted_width = usize::from(omitted.is_some());
+        let occupied = fixed_width + tabs.len + omitted_width;
+
+        let mut blocks = Vec::with_capacity(cols);
+        blocks.append(&mut session.blocks);
+        blocks.push(pad.clone());
+        blocks.append(&mut tabs.blocks);
+        if let Some(omitted) = omitted {
+            blocks.push(omitted);
+        }
+        if occupied < cols {
+            blocks.push(Bg::render(cols - occupied, palette));
+        }
+        blocks.push(pad);
+        blocks.append(&mut datetime.blocks);
+
+        let mut bar = String::new();
+        let mut cursor = 0;
+
+        for block in blocks {
+            bar = format!("{}{}", bar, block.body);
+
+            if let Some(idx) = block.tab_index {
+                if self.should_change_tab
+                    && self.mouse_click_pos >= cursor
+                    && self.mouse_click_pos < cursor + block.len
+                {
+                    // Tabs are indexed starting from 1, therefore we need add 1 to idx
+                    let tab_index = idx + 1;
+                    switch_tab_to(tab_index as u32);
+                }
+            }
+
+            cursor += block.len;
+        }
+
+        let bg = match palette.theme_hue {
+            ThemeHue::Dark => palette.black,
+            ThemeHue::Light => palette.white,
+        };
+
+        match bg {
+            PaletteColor::Rgb((r, g, b)) => {
+                print!("{}\u{1b}[48;2;{};{};{}m\u{1b}[0K", bar, r, g, b);
+            }
+            PaletteColor::EightBit(color) => {
+                print!("{}\u{1b}[48;5;{}m\u{1b}[0K", bar, color);
+            }
+        }
+
+        self.should_change_tab = false;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{collections::HashMap, path::Path};
+
+    use zellij_tile::prelude::{
+        EventType, PaneId, PaneInfo, PaneManifest, PermissionType, TabInfo,
+    };
+
+    use super::{
+        State, open_workspace_picker_with, plugin_permissions, sidebar_events, statusbar_events,
+    };
+
+    fn plugin(id: u32) -> PaneInfo {
+        PaneInfo {
+            id,
+            is_plugin: true,
+            ..PaneInfo::default()
+        }
+    }
+
+    #[test]
+    fn only_the_sidebar_in_the_active_tab_handles_global_messages() {
+        let mut state = State {
+            plugin_id: 9,
+            tabs: vec![
+                TabInfo {
+                    position: 0,
+                    active: false,
+                    ..TabInfo::default()
+                },
+                TabInfo {
+                    position: 1,
+                    active: true,
+                    ..TabInfo::default()
+                },
+            ],
+            pane_manifest: PaneManifest {
+                panes: HashMap::from([(0, vec![plugin(9)]), (1, vec![plugin(12)])]),
+            },
+            ..State::default()
+        };
+
+        assert!(!state.sidebar_is_on_active_tab());
+        state.plugin_id = 12;
+        assert!(state.sidebar_is_on_active_tab());
+    }
+
+    #[test]
+    fn both_views_receive_permission_results() {
+        assert!(statusbar_events().contains(&EventType::PermissionRequestResult));
+        assert!(sidebar_events().contains(&EventType::PermissionRequestResult));
+    }
+
+    #[test]
+    fn every_view_requests_the_complete_sidebar_permission_set() {
+        assert_eq!(
+            plugin_permissions(),
+            vec![
+                PermissionType::ReadApplicationState,
+                PermissionType::ChangeApplicationState,
+                PermissionType::RunCommands,
+            ]
+        );
+    }
+
+    #[test]
+    fn workspace_picker_reveals_and_focuses_the_opened_floating_pane() {
+        let mut opened_command = None;
+        let mut shown_pane = None;
+
+        open_workspace_picker_with(
+            Path::new("/work/project"),
+            |command, _coordinates, _context| {
+                opened_command = Some(command);
+                Some(PaneId::Terminal(42))
+            },
+            |pane_id, should_float_if_hidden, should_focus_pane| {
+                shown_pane = Some((pane_id, should_float_if_hidden, should_focus_pane));
+            },
+        );
+
+        let command = opened_command.expect("workspace picker command was not opened");
+        assert_eq!(command.path, Path::new("zellij-workspaces"));
+        assert_eq!(command.args, ["--new"]);
+        assert_eq!(command.cwd.as_deref(), Some(Path::new("/work/project")));
+        assert_eq!(shown_pane, Some((PaneId::Terminal(42), true, true)));
+    }
+}

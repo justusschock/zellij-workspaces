@@ -1,0 +1,27 @@
+layout {
+    default_tab_template {
+        pane split_direction="vertical" {
+            pane size=18 borderless=true {
+                plugin location="session-ui" { view "sidebar"; }
+            }
+            pane { children; }
+        }
+        pane size=1 borderless=true {
+            plugin location="session-ui" { view "statusbar"; }
+        }
+    }
+
+    tab name="editor" focus=true cwd="{{ workspace.cwd | kdl }}" {
+        pane name="editor" command="{{ tools.shell | kdl }}" close_on_exit=false {
+            args "-lc" "exec {{ tools.editor | kdl }} ."
+        }
+    }
+
+    tab name="agent" cwd="{{ workspace.cwd | kdl }}" {
+        pane name="agent" command="{{ tools.shell | kdl }}" close_on_exit=false {
+            args "-lc" "exec {{ vars.AGENT | default('sh') | shell }}"
+        }
+    }
+
+    tab name="shell" cwd="{{ workspace.cwd | kdl }}"
+}
