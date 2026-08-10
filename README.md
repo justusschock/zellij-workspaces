@@ -19,6 +19,13 @@ the creation flow immediately offers new or edited templates:
 
 ![The runtime workspace template selector offering default, development, and services layouts](docs/images/template-selector.png)
 
+## Releases
+
+Each version tag publishes native `zellij-workspaces` archives for Linux and
+macOS on x86_64 and ARM64, plus `session-ui.wasm` and `SHA256SUMS`, on the
+[GitHub Releases page](https://github.com/justusschock/zellij-workspaces/releases).
+Tags must match the Cargo workspace version, for example `v0.1.0`.
+
 ## Build and install
 
 Requirements: stable Rust, Zellij, and the `wasm32-wasip1` Rust target.
