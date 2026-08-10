@@ -7,6 +7,18 @@ Workspace templates are ordinary Zellij KDL with MiniJinja placeholders. They
 are discovered and rendered at runtime, so adding or editing one never
 requires rebuilding the runner or plugin.
 
+## Screenshots
+
+The responsive workspace dashboard keeps sessions visible in the left sidebar,
+tabs along the bottom, and the rest of the terminal available for real work:
+
+![A Zellij workspace with a session sidebar, editor and checks panes, and a compact bottom tab bar](docs/images/workspace-dashboard.png)
+
+Workspace layouts are discovered from the templates directory at runtime, so
+the creation flow immediately offers new or edited templates:
+
+![The runtime workspace template selector offering default, development, and services layouts](docs/images/template-selector.png)
+
 ## Build and install
 
 Requirements: stable Rust, Zellij, and the `wasm32-wasip1` Rust target.
@@ -19,6 +31,7 @@ mkdir -p ~/.config/zellij/plugins ~/.config/zellij-workspaces/templates
 cp target/wasm32-wasip1/release/session-ui.wasm \
   ~/.config/zellij/plugins/session-ui.wasm
 cp examples/*.kdl.tmpl ~/.config/zellij-workspaces/templates/
+cp examples/keymaps.kdl ~/.config/zellij-workspaces/keymaps.kdl
 ```
 
 Register the plugin in `~/.config/zellij/config.kdl`:
@@ -71,6 +84,24 @@ zellij-workspaces --render development demo "$PWD"
 The command prints the generated layout path, which is useful for inspection
 and validation.
 
+## Keymaps
+
+Picker and sidebar bindings live in
+`~/.config/zellij-workspaces/keymaps.kdl`. Each named action accepts one or
+more keys using Zellij's key spelling, such as `"j"`, `"Up"`, `"Enter"`, or
+`"Ctrl n"`. Copy `examples/keymaps.kdl` for the complete default file.
+
+The native picker reads this file directly. The sandboxed sidebar asks the
+installed `zellij-workspaces` runner for the normalized `sidebar` section, so
+both interfaces use one source without giving the WASM plugin filesystem
+access. Missing files use built-in defaults. Invalid files stop the native
+runner with a configuration error; an already-running sidebar keeps its safe
+defaults if reloading fails.
+
+These mappings apply only while the picker or sidebar has focus. Global Zellij
+bindings that open or focus the sidebar remain in `~/.config/zellij/config.kdl`
+because Zellij must intercept them before the plugin receives input.
+
 ## Examples
 
 `examples/development.kdl.tmpl` demonstrates editor, agent, and shell tabs.
@@ -85,6 +116,7 @@ The runner supports these environment variables:
 - `ZELLIJ_WORKSPACES_IGNORE_DIRS`
 - `ZELLIJ_WORKSPACES_MAX_DIRS_DEPTH`
 - `ZELLIJ_WORKSPACES_TEMPLATES_DIR`
+- `ZELLIJ_WORKSPACES_KEYMAPS_FILE`
 - `ZELLIJ_WORKSPACES_CACHE_DIR`
 - `ZELLIJ_WORKSPACES_BANNERS_DIR`
 

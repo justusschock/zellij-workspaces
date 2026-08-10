@@ -1,5 +1,6 @@
 mod color;
 mod datetime;
+mod keymap;
 mod model;
 mod session;
 mod sidebar;
@@ -18,6 +19,7 @@ use zellij_tile_utils::style;
 
 use crate::{
     datetime::DateTime,
+    keymap::{SidebarAction, SidebarKeymaps},
     model::{SidebarRow, dashboard_rows, is_wide, unread_count},
     session::Session,
     sidebar::{move_selection, row_for_screen_line},
@@ -27,6 +29,7 @@ use crate::{
 };
 
 const SIDEBAR_REFRESH_SECONDS: f64 = 5.0;
+const KEYMAP_CONTEXT: &str = "zellij-workspaces-sidebar-keymaps";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum PluginView {
@@ -56,6 +59,7 @@ struct State {
     sidebar_wide: Option<bool>,
     permissions_granted: bool,
     permission_error: Option<String>,
+    sidebar_keymaps: SidebarKeymaps,
 }
 
 register_plugin!(State);
@@ -124,6 +128,14 @@ fn host_open_workspace_picker(initial_cwd: &std::path::Path) {
     let _ = initial_cwd;
 }
 
+fn host_load_sidebar_keymaps() {
+    #[cfg(target_family = "wasm")]
+    run_command(
+        &["zellij-workspaces", "--print-sidebar-keymaps"],
+        BTreeMap::from([("zellij-workspaces".to_owned(), KEYMAP_CONTEXT.to_owned())]),
+    );
+}
+
 fn plugin_permissions() -> Vec<PermissionType> {
     vec![
         PermissionType::ReadApplicationState,
@@ -153,6 +165,7 @@ fn sidebar_events() -> Vec<EventType> {
         EventType::Mouse,
         EventType::Timer,
         EventType::Visible,
+        EventType::RunCommandResult,
     ]
 }
 
@@ -199,6 +212,7 @@ impl ZellijPlugin for State {
                             self.clamp_sidebar_selection();
                         }
                         set_timeout(SIDEBAR_REFRESH_SECONDS);
+                        host_load_sidebar_keymaps();
                         if let Some(columns) = self
                             .tabs
                             .iter()
@@ -294,6 +308,27 @@ impl ZellijPlugin for State {
                     }
                     set_timeout(SIDEBAR_REFRESH_SECONDS);
                 }
+            }
+            Event::RunCommandResult(exit_code, stdout, stderr, context)
+                if self.view == PluginView::Sidebar
+                    && context.get("zellij-workspaces").map(String::as_str)
+                        == Some(KEYMAP_CONTEXT) =>
+            {
+                if exit_code == Some(0) {
+                    match String::from_utf8(stdout)
+                        .map_err(|error| error.to_string())
+                        .and_then(|source| SidebarKeymaps::from_protocol(&source))
+                    {
+                        Ok(keymaps) => self.sidebar_keymaps = keymaps,
+                        Err(error) => eprintln!("Failed to load sidebar keymaps: {error}"),
+                    }
+                } else {
+                    eprintln!(
+                        "Failed to load sidebar keymaps: {}",
+                        String::from_utf8_lossy(&stderr).trim()
+                    );
+                }
+                should_render = false;
             }
             _ => {
                 eprintln!("Unexpected event: {:?}", event);
@@ -407,31 +442,27 @@ impl State {
     }
 
     fn handle_sidebar_key(&mut self, key: KeyWithModifier) -> bool {
-        if !key.key_modifiers.is_empty() {
-            return false;
-        }
-
-        match key.bare_key {
-            BareKey::Char('j') | BareKey::Down => {
+        match self.sidebar_keymaps.action(&key) {
+            Some(SidebarAction::Down) => {
                 self.sidebar_selected =
                     move_selection(self.sidebar_selected, 1, self.sidebar_rows().len());
                 true
             }
-            BareKey::Char('k') | BareKey::Up => {
+            Some(SidebarAction::Up) => {
                 self.sidebar_selected =
                     move_selection(self.sidebar_selected, -1, self.sidebar_rows().len());
                 true
             }
-            BareKey::Enter => self.activate_sidebar_selection(),
-            BareKey::Char('n') => {
+            Some(SidebarAction::Open) => self.activate_sidebar_selection(),
+            Some(SidebarAction::NewWorkspace) => {
                 self.open_workspace_picker();
                 true
             }
-            BareKey::Esc => {
+            Some(SidebarAction::Cancel) => {
                 self.leave_sidebar();
                 true
             }
-            _ => false,
+            None => false,
         }
     }
 
@@ -635,6 +666,8 @@ mod tests {
     fn both_views_receive_permission_results() {
         assert!(statusbar_events().contains(&EventType::PermissionRequestResult));
         assert!(sidebar_events().contains(&EventType::PermissionRequestResult));
+        assert!(sidebar_events().contains(&EventType::RunCommandResult));
+        assert!(!statusbar_events().contains(&EventType::RunCommandResult));
     }
 
     #[test]

@@ -14,13 +14,11 @@ crossterm = "0.25.0"
 dirs = "4.0.0"
 fastrand = "1.9.0"
 ignore = "0.4.20"
+kdl = "4.7.1"
 minijinja = "2.23.0"
 serde = { version = "1.0.228", features = ["derive"] }
 tui = "0.19.0"
 unicode-width = "0.1.14"
-
-[dev-dependencies]
-kdl = "4.7.1"
 
 [lints]
 workspace = true

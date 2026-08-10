@@ -1,0 +1,20 @@
+keymaps {
+    picker {
+        up "Up"
+        down "Down"
+        accept "Enter"
+        cancel "Esc"
+        quit "Ctrl c"
+        new_workspace "Ctrl n"
+        yes "y"
+        no "n"
+    }
+
+    sidebar {
+        up "k" "Up"
+        down "j" "Down"
+        open "Enter"
+        new_workspace "n"
+        cancel "Esc"
+    }
+}
