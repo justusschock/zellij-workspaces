@@ -1,0 +1,7 @@
+layout {
+    tab name="{{ tab.name | kdl }}" focus=true {
+        pane cwd="{{ worktree.cwd | kdl }}" command="{{ tools.shell | kdl }}" close_on_exit=false {
+            args "-lic" "agent; exit_code=$?; printf '\\n[agent exited: %s]\\n' $exit_code; exec {{ tools.shell | shell }} -l"
+        }
+    }
+}

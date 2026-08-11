@@ -6,7 +6,9 @@
 //! `~/.config/zellij-workspaces/templates` unless overridden.
 
 mod action;
+mod config;
 mod dir;
+mod git;
 mod keymap;
 mod log;
 mod options;

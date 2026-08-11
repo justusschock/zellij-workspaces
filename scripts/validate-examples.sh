@@ -17,4 +17,14 @@ for template in development services; do
   fi
 done
 
+tab_layout=$(
+  ZELLIJ_WORKSPACES_TAB_TEMPLATES_DIR="$repo_root/examples" \
+    ZELLIJ_WORKSPACES_CACHE_DIR="$cache_dir" \
+    cargo run --quiet --package zellij-workspaces -- \
+    --render-tab agent-tab topic "$repo_root"
+)
+if command -v zellij >/dev/null 2>&1; then
+  zellij --layout "$tab_layout" setup --check >/dev/null
+fi
+
 printf '%s\n' "workspace examples: ok"

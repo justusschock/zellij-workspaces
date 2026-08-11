@@ -32,6 +32,16 @@ struct Workspace<'a> {
 }
 
 #[derive(Serialize)]
+struct Tab<'a> {
+    name: &'a str,
+}
+
+#[derive(Serialize)]
+struct Worktree<'a> {
+    cwd: &'a str,
+}
+
+#[derive(Serialize)]
 struct Tools {
     shell: String,
     editor: String,
@@ -73,7 +83,10 @@ impl TemplateEngine {
             .ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::NotFound,
-                    format!("workspace template `{template_name}` was not found"),
+                    format!(
+                        "workspace template `{template_name}` was not found in {}",
+                        self.templates_dir.display()
+                    ),
                 )
             })?;
         let source = fs::read_to_string(&template.path)?;
@@ -101,6 +114,53 @@ impl TemplateEngine {
             .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
 
         self.write_cache(&template.name, &rendered)
+    }
+
+    pub(crate) fn render_tab(
+        &self,
+        template_name: &str,
+        tab_name: &str,
+        worktree_dir: &Dir,
+    ) -> io::Result<PathBuf> {
+        let template = self
+            .discover()?
+            .into_iter()
+            .find(|template| template.name == template_name)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::NotFound,
+                    format!(
+                        "tab template `{template_name}` was not found in {}",
+                        self.templates_dir.display()
+                    ),
+                )
+            })?;
+        let source = fs::read_to_string(&template.path)?;
+        let cwd = worktree_dir.as_path().to_str().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "worktree path is not valid UTF-8",
+            )
+        })?;
+
+        let mut environment = Environment::new();
+        environment.set_undefined_behavior(UndefinedBehavior::Strict);
+        environment.add_filter("kdl", kdl_escape);
+        environment.add_filter("shell", shell_escape_for_kdl);
+
+        let rendered = environment
+            .template_from_str(&source)
+            .and_then(|template| {
+                template.render(context! {
+                    tab => Tab { name: tab_name },
+                    worktree => Worktree { cwd },
+                    tools => Tools::from_environment(),
+                    vars => explicit_variables(),
+                })
+            })
+            .map_err(|error| io::Error::new(io::ErrorKind::InvalidData, error))?;
+
+        self.write_cache(&format!("tab-{template_name}"), &rendered)
     }
 
     fn from_path(path: PathBuf) -> Option<WorkspaceTemplate> {
@@ -319,6 +379,32 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.exists());
         assert!(second.exists());
+    }
+
+    #[test]
+    fn renders_tab_and_worktree_context_from_a_separate_template_directory() {
+        let (root, _engine) = fixture();
+        let tab_templates = root.path().join("tab-templates");
+        fs::create_dir(&tab_templates).unwrap();
+        fs::write(
+            tab_templates.join("agent.kdl.tmpl"),
+            "layout { tab name=\"{{ tab.name | kdl }}\" { pane cwd=\"{{ worktree.cwd | kdl }}\" command=\"agent\" } }",
+        )
+        .unwrap();
+        let engine = TemplateEngine::new(tab_templates, root.path().join("cache"));
+
+        let rendered = engine
+            .render_tab(
+                "agent",
+                "fix-login",
+                &Dir::from(root.path().join("worktree")),
+            )
+            .unwrap();
+        let contents = fs::read_to_string(rendered).unwrap();
+
+        assert!(contents.contains("fix-login"));
+        assert!(contents.contains("worktree"));
+        assert!(contents.contains("command=\"agent\""));
     }
 
     #[test]

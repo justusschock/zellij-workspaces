@@ -10,6 +10,8 @@ pub(crate) struct Options {
     pub ignore: Vec<String>,
     pub depth: Option<usize>,
     pub templates: PathBuf,
+    pub tab_templates: PathBuf,
+    pub config: PathBuf,
     pub keymaps: PathBuf,
     pub cache: PathBuf,
     pub banners: Option<Dir>,
@@ -25,6 +27,14 @@ impl Options {
             depth: parse_depth(),
             templates: path_from_home("ZELLIJ_WORKSPACES_TEMPLATES_DIR")
                 .unwrap_or_else(|| Dir::home().join(".config/zellij-workspaces/templates"))
+                .as_path()
+                .to_path_buf(),
+            tab_templates: path_from_home("ZELLIJ_WORKSPACES_TAB_TEMPLATES_DIR")
+                .unwrap_or_else(|| Dir::home().join(".config/zellij-workspaces/tab-templates"))
+                .as_path()
+                .to_path_buf(),
+            config: path_from_home("ZELLIJ_WORKSPACES_CONFIG_FILE")
+                .unwrap_or_else(|| Dir::home().join(".config/zellij-workspaces/workspaces.kdl"))
                 .as_path()
                 .to_path_buf(),
             keymaps: path_from_home("ZELLIJ_WORKSPACES_KEYMAPS_FILE")
@@ -83,6 +93,12 @@ mod tests {
     fn defaults_include_runtime_template_and_cache_directories() {
         let options = Options::new();
         assert!(options.templates.ends_with("zellij-workspaces/templates"));
+        assert!(
+            options
+                .tab_templates
+                .ends_with("zellij-workspaces/tab-templates")
+        );
+        assert!(options.config.ends_with("zellij-workspaces/workspaces.kdl"));
         assert!(options.keymaps.ends_with("zellij-workspaces/keymaps.kdl"));
         assert!(options.cache.ends_with("zellij-workspaces/layouts"));
     }

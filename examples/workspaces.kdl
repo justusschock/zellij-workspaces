@@ -1,0 +1,4 @@
+workspaces {
+    workspace "project" cwd="~/Developer/project" template="development"
+    workspace "services" cwd="~" template="services"
+}

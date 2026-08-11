@@ -24,6 +24,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::{
     action::Action,
     dir::Dir,
+    git::Repository,
     keymap::{Keymaps, PickerAction},
     log,
     options::OPTIONS,
@@ -39,6 +40,19 @@ pub(crate) fn action_selector(sessions: zellij::Sessions) -> Action {
 pub(crate) fn new_session_prompt(sessions: zellij::Sessions) -> Action {
     let screen = ChangeCurrentDirPromptScreen;
     UI::render(Box::new(screen), sessions)
+}
+
+pub(crate) fn new_worktree_tab_prompt(template: String) -> Action {
+    let repository = match Repository::discover(&Dir::cwd()) {
+        Ok(repository) => repository,
+        Err(error) => return Action::Exit(Err(error)),
+    };
+    let worktrees = match repository.worktrees() {
+        Ok(worktrees) => worktrees,
+        Err(error) => return Action::Exit(Err(error)),
+    };
+    let screen = WorktreeModeScreen::new(repository, worktrees, template);
+    UI::render(Box::new(screen), zellij::Sessions::empty())
 }
 
 static BANNERS: LazyLock<Banners> = LazyLock::new(Banners::new);
@@ -1361,6 +1375,308 @@ impl Screen for TemplateSelectorScreen {
                 }
                 EventResult::Exit => {
                     return Ok(ScreenResult::Action(Action::Exit(Ok(()))));
+                }
+            }
+        }
+    }
+}
+
+#[derive(Clone, PartialEq)]
+enum WorktreeMode {
+    Existing,
+    Create,
+}
+
+struct WorktreeModeScreen {
+    selector: Selector<'static, WorktreeMode>,
+    repository: Repository,
+    worktrees: Vec<Dir>,
+    template: String,
+}
+
+impl WorktreeModeScreen {
+    fn new(repository: Repository, worktrees: Vec<Dir>, template: String) -> Self {
+        let items = vec![
+            SelectorItem {
+                label: "Use existing worktree".into(),
+                value: SelectorValue::Selectable(WorktreeMode::Existing),
+            },
+            SelectorItem {
+                label: "Create new worktree".into(),
+                value: SelectorValue::Selectable(WorktreeMode::Create),
+            },
+        ];
+        Self {
+            selector: Selector::with_items(items),
+            repository,
+            worktrees,
+            template,
+        }
+    }
+
+    fn draw(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<()> {
+        term.draw(|frame| {
+            let layout = UI::layout(
+                frame,
+                &[Constraint::Length(2), Constraint::Min(3)],
+                &ctx.banner,
+            );
+            Title::render(&"Open workstream tab", frame, layout[0]);
+            self.selector.render(frame, layout[1]);
+        })?;
+        Ok(())
+    }
+}
+
+impl Screen for WorktreeModeScreen {
+    fn render(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<ScreenResult> {
+        loop {
+            self.draw(term, ctx)?;
+            if let Event::Key(key) = event::read()? {
+                match ctx.keymaps.picker.action(&key) {
+                    Some(PickerAction::Quit | PickerAction::Cancel) => {
+                        return Ok(ScreenResult::Action(Action::Exit(Ok(()))));
+                    }
+                    Some(PickerAction::Down) => self.selector.next(),
+                    Some(PickerAction::Up) => self.selector.previous(),
+                    Some(PickerAction::Accept) => match self.selector.flush() {
+                        Ok(Some(WorktreeMode::Existing)) => {
+                            return Ok(ScreenResult::NextScreen(Box::new(
+                                WorktreeSelectorScreen::new(
+                                    self.repository.clone(),
+                                    self.worktrees.clone(),
+                                    self.template.clone(),
+                                ),
+                            )));
+                        }
+                        Ok(Some(WorktreeMode::Create)) => {
+                            return Ok(ScreenResult::NextScreen(Box::new(
+                                WorkstreamNameScreen::new(
+                                    self.repository.clone(),
+                                    self.worktrees.clone(),
+                                    self.template.clone(),
+                                ),
+                            )));
+                        }
+                        Ok(None) => {}
+                        Err(error) => return Err(io::Error::other(error)),
+                    },
+                    None
+                    | Some(PickerAction::NewWorkspace | PickerAction::Yes | PickerAction::No) => {}
+                }
+            }
+        }
+    }
+}
+
+struct WorktreeSelectorScreen {
+    selector: Selector<'static, Dir>,
+    repository: Repository,
+    worktrees: Vec<Dir>,
+    template: String,
+}
+
+impl WorktreeSelectorScreen {
+    fn new(repository: Repository, worktrees: Vec<Dir>, template: String) -> Self {
+        let items = worktrees
+            .iter()
+            .map(|worktree| SelectorItem {
+                label: worktree.to_string().into(),
+                value: SelectorValue::Selectable(worktree.clone()),
+            })
+            .collect();
+        Self {
+            selector: Selector::with_items(items),
+            repository,
+            worktrees,
+            template,
+        }
+    }
+
+    fn previous(&self) -> WorktreeModeScreen {
+        WorktreeModeScreen::new(
+            self.repository.clone(),
+            self.worktrees.clone(),
+            self.template.clone(),
+        )
+    }
+
+    fn draw(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<()> {
+        term.draw(|frame| {
+            let layout = UI::layout(
+                frame,
+                &[Constraint::Length(2), Constraint::Min(3)],
+                &ctx.banner,
+            );
+            Title::render(&"Select existing worktree", frame, layout[0]);
+            self.selector.render(frame, layout[1]);
+        })?;
+        Ok(())
+    }
+}
+
+impl Screen for WorktreeSelectorScreen {
+    fn render(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<ScreenResult> {
+        loop {
+            self.draw(term, ctx)?;
+            if let Event::Key(key) = event::read()? {
+                match ctx.keymaps.picker.action(&key) {
+                    Some(PickerAction::Quit) => {
+                        return Ok(ScreenResult::Action(Action::Exit(Ok(()))));
+                    }
+                    Some(PickerAction::Cancel) => {
+                        return Ok(ScreenResult::NextScreen(Box::new(self.previous())));
+                    }
+                    Some(PickerAction::Down) => self.selector.next(),
+                    Some(PickerAction::Up) => self.selector.previous(),
+                    Some(PickerAction::Accept) => match self.selector.flush() {
+                        Ok(Some(worktree)) => {
+                            return Ok(ScreenResult::NextScreen(Box::new(TabNameScreen::new(
+                                self.repository.clone(),
+                                self.worktrees.clone(),
+                                self.template.clone(),
+                                worktree,
+                            ))));
+                        }
+                        Ok(None) => {}
+                        Err(error) => return Err(io::Error::other(error)),
+                    },
+                    None
+                    | Some(PickerAction::NewWorkspace | PickerAction::Yes | PickerAction::No) => {}
+                }
+            }
+        }
+    }
+}
+
+struct TabNameScreen {
+    input: Input,
+    repository: Repository,
+    worktrees: Vec<Dir>,
+    template: String,
+    worktree: Dir,
+}
+
+impl TabNameScreen {
+    fn new(repository: Repository, worktrees: Vec<Dir>, template: String, worktree: Dir) -> Self {
+        let input = match worktree.filename() {
+            Some(name) => Input::with_value(name, "Give tab a name"),
+            None => Input::new("Give tab a name"),
+        };
+        Self {
+            input,
+            repository,
+            worktrees,
+            template,
+            worktree,
+        }
+    }
+}
+
+impl Screen for TabNameScreen {
+    fn render(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<ScreenResult> {
+        loop {
+            term.draw(|frame| {
+                let layout = UI::layout(frame, &[Constraint::Length(3)], &ctx.banner);
+                self.input.render(frame, layout[0]);
+            })?;
+            if let Event::Key(key) = event::read()? {
+                match ctx.keymaps.picker.action(&key) {
+                    Some(PickerAction::Quit) => {
+                        return Ok(ScreenResult::Action(Action::Exit(Ok(()))));
+                    }
+                    Some(PickerAction::Cancel) => {
+                        return Ok(ScreenResult::NextScreen(Box::new(
+                            WorktreeSelectorScreen::new(
+                                self.repository.clone(),
+                                self.worktrees.clone(),
+                                self.template.clone(),
+                            ),
+                        )));
+                    }
+                    Some(PickerAction::Accept) if !self.input.is_empty() => {
+                        return Ok(ScreenResult::Action(Action::CreateTab {
+                            template: self.template.clone(),
+                            name: self.input.value.clone(),
+                            dir: self.worktree.clone(),
+                        }));
+                    }
+                    Some(PickerAction::Accept) => {}
+                    None
+                    | Some(
+                        PickerAction::Up
+                        | PickerAction::Down
+                        | PickerAction::NewWorkspace
+                        | PickerAction::Yes
+                        | PickerAction::No,
+                    ) => match key.code {
+                        KeyCode::Char(character) => self.input.insert(character),
+                        KeyCode::Backspace => self.input.delete(),
+                        _ => {}
+                    },
+                }
+            }
+        }
+    }
+}
+
+struct WorkstreamNameScreen {
+    input: Input,
+    repository: Repository,
+    worktrees: Vec<Dir>,
+    template: String,
+}
+
+impl WorkstreamNameScreen {
+    fn new(repository: Repository, worktrees: Vec<Dir>, template: String) -> Self {
+        Self {
+            input: Input::new("Name workstream, branch, worktree, and tab"),
+            repository,
+            worktrees,
+            template,
+        }
+    }
+}
+
+impl Screen for WorkstreamNameScreen {
+    fn render(&mut self, term: &mut Term, ctx: &UIContext) -> io::Result<ScreenResult> {
+        loop {
+            term.draw(|frame| {
+                let layout = UI::layout(frame, &[Constraint::Length(3)], &ctx.banner);
+                self.input.render(frame, layout[0]);
+            })?;
+            if let Event::Key(key) = event::read()? {
+                match ctx.keymaps.picker.action(&key) {
+                    Some(PickerAction::Quit) => {
+                        return Ok(ScreenResult::Action(Action::Exit(Ok(()))));
+                    }
+                    Some(PickerAction::Cancel) => {
+                        return Ok(ScreenResult::NextScreen(Box::new(WorktreeModeScreen::new(
+                            self.repository.clone(),
+                            self.worktrees.clone(),
+                            self.template.clone(),
+                        ))));
+                    }
+                    Some(PickerAction::Accept) if !self.input.is_empty() => {
+                        return Ok(ScreenResult::Action(Action::CreateWorktreeTab {
+                            template: self.template.clone(),
+                            workstream: self.input.value.clone(),
+                            repository: self.repository.clone(),
+                        }));
+                    }
+                    Some(PickerAction::Accept) => {}
+                    None
+                    | Some(
+                        PickerAction::Up
+                        | PickerAction::Down
+                        | PickerAction::NewWorkspace
+                        | PickerAction::Yes
+                        | PickerAction::No,
+                    ) => match key.code {
+                        KeyCode::Char(character) => self.input.insert(character),
+                        KeyCode::Backspace => self.input.delete(),
+                        _ => {}
+                    },
                 }
             }
         }

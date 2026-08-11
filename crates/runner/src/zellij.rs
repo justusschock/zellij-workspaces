@@ -134,6 +134,48 @@ pub(crate) fn create(
     cmd.args(args).status()
 }
 
+pub(crate) fn ensure_background(
+    session: &str,
+    layout: &str,
+    dir: &Dir,
+) -> Result<ExitStatus, io::Error> {
+    Command::new(BIN)
+        .args(background_args(session, layout, dir))
+        .status()
+}
+
+fn background_args(session: &str, layout: &str, dir: &Dir) -> Vec<OsString> {
+    vec![
+        "attach".into(),
+        "--create-background".into(),
+        session.into(),
+        "options".into(),
+        "--default-cwd".into(),
+        dir.as_os_str().to_owned(),
+        "--default-layout".into(),
+        layout.into(),
+    ]
+}
+
+pub(crate) fn new_tab(name: &str, layout: &str, dir: &Dir) -> Result<ExitStatus, io::Error> {
+    Command::new(BIN)
+        .args(new_tab_args(name, layout, dir))
+        .status()
+}
+
+fn new_tab_args(name: &str, layout: &str, dir: &Dir) -> Vec<OsString> {
+    vec![
+        "action".into(),
+        "new-tab".into(),
+        "--name".into(),
+        name.into(),
+        "--cwd".into(),
+        dir.as_os_str().to_owned(),
+        "--layout".into(),
+        layout.into(),
+    ]
+}
+
 fn entry_args(
     inside: bool,
     session: &str,
@@ -181,7 +223,7 @@ pub(crate) fn attach(session: &str) -> Result<ExitStatus, io::Error> {
 mod tests {
     use std::ffi::OsString;
 
-    use super::{Sessions, attach_args, entry_args};
+    use super::{Sessions, attach_args, background_args, entry_args, new_tab_args};
     use crate::dir::Dir;
 
     fn strings(values: &[&str]) -> Vec<OsString> {
@@ -222,6 +264,44 @@ mod tests {
                 "work",
                 "--new-session-with-layout",
                 "/tmp/development.kdl",
+            ])
+        );
+    }
+
+    #[test]
+    fn default_workspaces_are_created_or_restored_in_the_background() {
+        assert_eq!(
+            background_args("work", "/tmp/codex.kdl", &Dir::from("/tmp/work".to_owned())),
+            strings(&[
+                "attach",
+                "--create-background",
+                "work",
+                "options",
+                "--default-cwd",
+                "/tmp/work",
+                "--default-layout",
+                "/tmp/codex.kdl",
+            ])
+        );
+    }
+
+    #[test]
+    fn worktree_tabs_use_the_rendered_layout_name_and_directory() {
+        assert_eq!(
+            new_tab_args(
+                "fix-login",
+                "/tmp/tab.kdl",
+                &Dir::from("/tmp/tree".to_owned())
+            ),
+            strings(&[
+                "action",
+                "new-tab",
+                "--name",
+                "fix-login",
+                "--cwd",
+                "/tmp/tree",
+                "--layout",
+                "/tmp/tab.kdl",
             ])
         );
     }

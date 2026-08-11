@@ -1,6 +1,6 @@
 use std::{io, process};
 
-use crate::{dir::Dir, log, options::OPTIONS, template::TemplateEngine, zellij};
+use crate::{dir::Dir, git::Repository, log, options::OPTIONS, template::TemplateEngine, zellij};
 
 pub(crate) enum Action {
     AttachToSession(String),
@@ -8,6 +8,16 @@ pub(crate) enum Action {
         session: String,
         template: Option<String>,
         dir: Option<Dir>,
+    },
+    CreateTab {
+        template: String,
+        name: String,
+        dir: Dir,
+    },
+    CreateWorktreeTab {
+        template: String,
+        workstream: String,
+        repository: Repository,
     },
     Exit(Result<(), io::Error>),
 }
@@ -37,6 +47,19 @@ impl Action {
                 zellij::create(&session, &layout, &wd)
             }
             Action::AttachToSession(session) => zellij::attach(&session),
+            Action::CreateTab {
+                template,
+                name,
+                dir,
+            } => Self::open_tab(&template, &name, &dir),
+            Action::CreateWorktreeTab {
+                template,
+                workstream,
+                repository,
+            } => match repository.create_worktree(&workstream) {
+                Ok(dir) => Self::open_tab(&template, &workstream, &dir),
+                Err(error) => Self::exit_with_error(error),
+            },
             Action::Exit(Ok(())) => process::exit(0),
             Action::Exit(Err(error)) => Self::exit_with_error(error),
         };
@@ -57,5 +80,11 @@ impl Action {
     fn exit_with_error(error: io::Error) -> ! {
         log::error(error);
         process::exit(1);
+    }
+
+    fn open_tab(template: &str, name: &str, dir: &Dir) -> Result<process::ExitStatus, io::Error> {
+        let engine = TemplateEngine::new(&OPTIONS.tab_templates, &OPTIONS.cache);
+        let layout = engine.render_tab(template, name, dir)?;
+        zellij::new_tab(name, &layout.to_string_lossy(), dir)
     }
 }

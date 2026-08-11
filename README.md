@@ -34,10 +34,15 @@ Requirements: stable Rust, Zellij, and the `wasm32-wasip1` Rust target.
 rustup target add wasm32-wasip1
 cargo install --path crates/runner
 cargo build --release --package zellij-session-ui --target wasm32-wasip1
-mkdir -p ~/.config/zellij/plugins ~/.config/zellij-workspaces/templates
+mkdir -p ~/.config/zellij/plugins \
+  ~/.config/zellij-workspaces/templates \
+  ~/.config/zellij-workspaces/tab-templates
 cp target/wasm32-wasip1/release/session-ui.wasm \
   ~/.config/zellij/plugins/session-ui.wasm
-cp examples/*.kdl.tmpl ~/.config/zellij-workspaces/templates/
+cp examples/development.kdl.tmpl examples/services.kdl.tmpl \
+  ~/.config/zellij-workspaces/templates/
+cp examples/agent-tab.kdl.tmpl \
+  ~/.config/zellij-workspaces/tab-templates/agent.kdl.tmpl
 cp examples/keymaps.kdl ~/.config/zellij-workspaces/keymaps.kdl
 ```
 
@@ -51,6 +56,43 @@ plugins {
 
 Run `zellij-workspaces` to select or create a workspace. Run
 `zellij-workspaces --new` to open the creation flow directly.
+
+Configured default workspaces are created or resurrected in the background
+before the interactive picker opens. Add them to
+`~/.config/zellij-workspaces/workspaces.kdl`:
+
+```kdl
+workspaces {
+    workspace "project" cwd="~/Developer/project" template="development"
+    workspace "services" cwd="~" template="services"
+}
+```
+
+The order is preserved. Each entry requires a unique session name, an existing
+working directory, and the name of a workspace template. A missing config file
+means no default workspaces.
+
+Run `zellij-workspaces --new-tab TEMPLATE` inside Zellij to open the workstream
+tab flow. Choose an existing Git worktree or create
+`<main-worktree>/.worktrees/<workstream>` with a same-named branch from the
+current `HEAD`. Existing worktrees also prompt for a tab name.
+
+Tab templates live in `~/.config/zellij-workspaces/tab-templates` and receive:
+
+- `tab.name`: the requested tab name
+- `worktree.cwd`: the selected or newly created worktree directory
+- `tools.shell`, `tools.editor`, and explicitly prefixed `vars`, as workspace
+  templates do
+
+The tab template owns the panes and commands. For example:
+
+```kdl
+layout {
+    tab name="{{ tab.name | kdl }}" focus=true {
+        pane cwd="{{ worktree.cwd | kdl }}" command="agent"
+    }
+}
+```
 
 ## Template contract
 
@@ -91,6 +133,12 @@ zellij-workspaces --render development demo "$PWD"
 The command prints the generated layout path, which is useful for inspection
 and validation.
 
+Render a tab template the same way:
+
+```sh
+zellij-workspaces --render-tab agent topic "$PWD"
+```
+
 ## Keymaps
 
 Picker and sidebar bindings live in
@@ -123,6 +171,8 @@ The runner supports these environment variables:
 - `ZELLIJ_WORKSPACES_IGNORE_DIRS`
 - `ZELLIJ_WORKSPACES_MAX_DIRS_DEPTH`
 - `ZELLIJ_WORKSPACES_TEMPLATES_DIR`
+- `ZELLIJ_WORKSPACES_TAB_TEMPLATES_DIR`
+- `ZELLIJ_WORKSPACES_CONFIG_FILE`
 - `ZELLIJ_WORKSPACES_KEYMAPS_FILE`
 - `ZELLIJ_WORKSPACES_CACHE_DIR`
 - `ZELLIJ_WORKSPACES_BANNERS_DIR`

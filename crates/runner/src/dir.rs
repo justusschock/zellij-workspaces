@@ -20,6 +20,21 @@ impl Dir {
             .into()
     }
 
+    pub fn from_home_path(path: &str) -> Self {
+        if path == "~" {
+            Self::home()
+        } else if let Some(path) = path.strip_prefix("~/") {
+            Self::home().join(path)
+        } else {
+            let path = PathBuf::from(path);
+            if path.is_absolute() {
+                Self(path)
+            } else {
+                Self::home().join(path)
+            }
+        }
+    }
+
     pub fn filename(&self) -> Option<String> {
         self.file_name()
             .and_then(|x| x.to_str().map(|x| x.to_string()))
@@ -85,5 +100,16 @@ mod tests {
     #[test]
     fn paths_outside_home_are_not_prefixed_with_tilde() {
         assert_eq!(Dir::from("/tmp/work".to_owned()).to_string(), "/tmp/work");
+    }
+
+    #[test]
+    fn configured_paths_expand_home_and_home_relative_values() {
+        assert_eq!(Dir::from_home_path("~"), Dir::home());
+        assert_eq!(Dir::from_home_path("~/work"), Dir::home().join("work"));
+        assert_eq!(Dir::from_home_path("work"), Dir::home().join("work"));
+        assert_eq!(
+            Dir::from_home_path("/tmp/work"),
+            Dir::from("/tmp/work".to_owned())
+        );
     }
 }
