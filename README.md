@@ -129,6 +129,11 @@ The runner supports these environment variables:
 
 Relative paths are resolved from the home directory.
 
+The directory picker also accepts any existing directory entered directly.
+Use `~` or `~/path` for a home-relative path, an absolute path, or a path
+relative to the shell that launched the picker. Directly entered paths do not
+need to be under `ZELLIJ_WORKSPACES_ROOT_DIR` or present in the discovered list.
+
 ## Attribution
 
 This project builds on Alex Fedoseev's Zellij runner and statusbar work. See

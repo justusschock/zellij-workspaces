@@ -300,7 +300,10 @@ mod tests {
         text::{Span, Spans},
     };
 
-    use super::{ActionSelectorItem, ActionSelectorScreen, Banner, Banners, UI};
+    use super::{
+        ActionSelectorItem, ActionSelectorScreen, Banner, Banners, UI, resolve_directory_input,
+    };
+    use crate::dir::Dir;
     use crate::zellij;
 
     #[test]
@@ -344,6 +347,42 @@ mod tests {
             selected,
             ActionSelectorItem::NewSession { input: None }
         ));
+    }
+
+    #[test]
+    fn directory_input_accepts_absolute_relative_and_home_paths() {
+        let root = Dir::from(std::env::temp_dir());
+
+        assert_eq!(
+            resolve_directory_input(root.to_string().as_str(), &Dir::from("/".to_owned())),
+            Some(root.clone())
+        );
+        assert_eq!(
+            resolve_directory_input(
+                root.filename().unwrap().as_str(),
+                &Dir::from(root.parent().unwrap()),
+            ),
+            Some(root)
+        );
+        assert_eq!(
+            resolve_directory_input("~", &Dir::from("/".to_owned())),
+            Some(Dir::home())
+        );
+        assert_eq!(
+            resolve_directory_input("~/", &Dir::from("/".to_owned())),
+            Some(Dir::home())
+        );
+    }
+
+    #[test]
+    fn directory_input_rejects_missing_paths() {
+        assert_eq!(
+            resolve_directory_input(
+                "/path/that/does/not/exist/zellij-workspaces",
+                &Dir::from("/".to_owned()),
+            ),
+            None
+        );
     }
 }
 
@@ -830,7 +869,7 @@ impl Screen for ChangeCurrentDirPromptScreen {
 
         let on_select = |should_change_dir| {
             if should_change_dir {
-                ScreenResult::NextScreen(Box::new(DirSelectorScreen::new()))
+                ScreenResult::NextScreen(Box::new(DirSelectorScreen::new(ctx.cwd.clone())))
             } else {
                 ScreenResult::NextScreen(Box::new(SessionNameScreen::new(
                     SessionNameScreen::default(&ctx.cwd),
@@ -847,13 +886,36 @@ pub struct DirSelectorScreen<'a> {
     input: Input,
     selector: Selector<'a, Dir>,
     dirs: Vec<Dir>,
+    cwd: Dir,
+}
+
+fn resolve_directory_input(input: &str, cwd: &Dir) -> Option<Dir> {
+    let input = input.trim();
+    if input.is_empty() {
+        return None;
+    }
+
+    let dir = if input == "~" {
+        Dir::home()
+    } else if let Some(path) = input.strip_prefix("~/") {
+        Dir::home().join(path)
+    } else {
+        let path = std::path::Path::new(input);
+        if path.is_absolute() {
+            Dir::from(path)
+        } else {
+            cwd.join(path)
+        }
+    };
+
+    dir.is_dir().then_some(dir)
 }
 
 // It would be cool to make this more responsive (debounce the search, move it to bg, etc.)
 // It works ok'ish for my use case on my machine,
 // but may be slow on less beefy machine with more files/folders
 impl<'a> DirSelectorScreen<'a> {
-    pub fn new() -> Self {
+    pub fn new(cwd: Dir) -> Self {
         use ignore::WalkBuilder;
 
         let results = WalkBuilder::new(&OPTIONS.root)
@@ -890,6 +952,7 @@ impl<'a> DirSelectorScreen<'a> {
             input: Input::new("Select directory"),
             selector: Selector::with_items(items),
             dirs,
+            cwd,
         }
     }
 
@@ -952,21 +1015,18 @@ impl<'a> DirSelectorScreen<'a> {
         let next_items = if self.input.is_empty() {
             Self::build_selector_list(&self.dirs)
         } else {
-            let dirs = self
-                .dirs
-                .iter()
-                .filter_map(|dir| {
-                    if dir
-                        .to_string()
-                        .to_lowercase()
-                        .contains(&self.input.value.to_lowercase())
-                    {
-                        Some(dir.clone())
-                    } else {
-                        None
-                    }
-                })
-                .collect::<Vec<Dir>>();
+            let query = self.input.value.to_lowercase();
+            let mut dirs = Vec::new();
+
+            if let Some(dir) = resolve_directory_input(&self.input.value, &self.cwd) {
+                dirs.push(dir);
+            }
+
+            for dir in &self.dirs {
+                if dir.to_string().to_lowercase().contains(&query) && !dirs.contains(dir) {
+                    dirs.push(dir.clone());
+                }
+            }
             Self::build_selector_list(&dirs)
         };
         self.selector = Selector::with_items(next_items);

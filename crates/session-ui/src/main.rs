@@ -208,8 +208,7 @@ impl ZellijPlugin for State {
                         set_selectable(false);
                     } else {
                         if let Ok(snapshot) = get_session_list() {
-                            self.sessions = snapshot;
-                            self.clamp_sidebar_selection();
+                            self.replace_sessions(snapshot);
                         }
                         set_timeout(SIDEBAR_REFRESH_SECONDS);
                         host_load_sidebar_keymaps();
@@ -256,11 +255,10 @@ impl ZellijPlugin for State {
             Event::SessionUpdate(live_sessions, resurrectable_sessions)
                 if self.view == PluginView::Sidebar =>
             {
-                self.sessions = SessionListSnapshot {
+                self.replace_sessions(SessionListSnapshot {
                     live_sessions,
                     resurrectable_sessions,
-                };
-                self.clamp_sidebar_selection();
+                });
                 should_render = true;
             }
             Event::Visible(visible) if self.view == PluginView::Sidebar => {
@@ -303,8 +301,7 @@ impl ZellijPlugin for State {
                 } else if self.permissions_granted {
                     if let Ok(snapshot) = get_session_list() {
                         should_render = self.sessions != snapshot;
-                        self.sessions = snapshot;
-                        self.clamp_sidebar_selection();
+                        self.replace_sessions(snapshot);
                     }
                     set_timeout(SIDEBAR_REFRESH_SECONDS);
                 }
@@ -394,6 +391,33 @@ impl State {
 
     fn clamp_sidebar_selection(&mut self) {
         self.sidebar_selected = move_selection(self.sidebar_selected, 0, self.sidebar_rows().len());
+    }
+
+    fn replace_sessions(&mut self, sessions: SessionListSnapshot) {
+        let previous_current = self
+            .sessions
+            .live_sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .map(|session| session.name.clone());
+        let next_current = sessions
+            .live_sessions
+            .iter()
+            .find(|session| session.is_current_session)
+            .map(|session| session.name.clone());
+
+        self.sessions = sessions;
+        if previous_current != next_current {
+            self.sidebar_selected = self
+                .sidebar_rows()
+                .iter()
+                .position(|row| matches!(row, SidebarRow::Live(session) if session.current))
+                .unwrap_or_else(|| {
+                    move_selection(self.sidebar_selected, 0, self.sidebar_rows().len())
+                });
+        } else {
+            self.clamp_sidebar_selection();
+        }
     }
 
     fn sidebar_is_focused(&self) -> bool {
@@ -617,10 +641,11 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::Path};
+    use std::{collections::HashMap, path::Path, time::Duration};
 
     use zellij_tile::prelude::{
-        EventType, PaneId, PaneInfo, PaneManifest, PermissionType, TabInfo,
+        EventType, PaneId, PaneInfo, PaneManifest, PermissionType, SessionInfo,
+        SessionListSnapshot, TabInfo,
     };
 
     use super::{
@@ -632,6 +657,15 @@ mod tests {
             id,
             is_plugin: true,
             ..PaneInfo::default()
+        }
+    }
+
+    fn session(name: &str, created_at: u64, current: bool) -> SessionInfo {
+        SessionInfo {
+            name: name.into(),
+            creation_time: Duration::from_secs(created_at),
+            is_current_session: current,
+            ..SessionInfo::default()
         }
     }
 
@@ -703,5 +737,36 @@ mod tests {
         assert_eq!(command.args, ["--new"]);
         assert_eq!(command.cwd.as_deref(), Some(Path::new("/work/project")));
         assert_eq!(shown_pane, Some((PaneId::Terminal(42), true, true)));
+    }
+
+    #[test]
+    fn session_switch_selects_the_new_current_workspace() {
+        let mut state = State::default();
+        state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true), session("second", 2, false)],
+            ..SessionListSnapshot::default()
+        });
+        assert_eq!(state.sidebar_selected, 0);
+
+        state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("first", 1, false), session("second", 2, true)],
+            ..SessionListSnapshot::default()
+        });
+        assert_eq!(state.sidebar_selected, 1);
+    }
+
+    #[test]
+    fn ordinary_refresh_preserves_manual_sidebar_selection() {
+        let snapshot = SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true), session("second", 2, false)],
+            ..SessionListSnapshot::default()
+        };
+        let mut state = State::default();
+        state.replace_sessions(snapshot.clone());
+        state.sidebar_selected = 1;
+
+        state.replace_sessions(snapshot);
+
+        assert_eq!(state.sidebar_selected, 1);
     }
 }
