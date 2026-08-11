@@ -28,7 +28,7 @@ use crate::{
     view::Bg,
 };
 
-const SIDEBAR_REFRESH_SECONDS: f64 = 5.0;
+const SIDEBAR_REFRESH_SECONDS: f64 = 1.0;
 const KEYMAP_CONTEXT: &str = "zellij-workspaces-sidebar-keymaps";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -86,6 +86,13 @@ fn host_switch_session(name: &str, tab_position: Option<usize>, pane_id: Option<
     switch_session_with_focus(name, tab_position, pane_id);
     #[cfg(not(target_family = "wasm"))]
     let _ = (name, tab_position, pane_id);
+}
+
+fn host_get_session_list() -> Result<SessionListSnapshot, String> {
+    #[cfg(target_family = "wasm")]
+    return get_session_list();
+    #[cfg(not(target_family = "wasm"))]
+    Err("session list is only available in the Zellij host".to_owned())
 }
 
 #[cfg(any(target_family = "wasm", test))]
@@ -169,6 +176,22 @@ fn sidebar_events() -> Vec<EventType> {
     ]
 }
 
+fn same_rendered_rows(left: &[SidebarRow], right: &[SidebarRow]) -> bool {
+    left.len() == right.len()
+        && left
+            .iter()
+            .zip(right)
+            .all(|(left, right)| match (left, right) {
+                (SidebarRow::Live(left), SidebarRow::Live(right)) => {
+                    left.name == right.name
+                        && left.current == right.current
+                        && left.unread_tabs == right.unread_tabs
+                }
+                (SidebarRow::NewWorkspace, SidebarRow::NewWorkspace) => true,
+                _ => false,
+            })
+}
+
 impl ZellijPlugin for State {
     fn load(&mut self, configuration: BTreeMap<String, String>) {
         self.view = match configuration.get("view").map(String::as_str) {
@@ -207,8 +230,8 @@ impl ZellijPlugin for State {
                     if self.view == PluginView::Statusbar {
                         set_selectable(false);
                     } else {
-                        if let Ok(snapshot) = get_session_list() {
-                            self.replace_sessions(snapshot);
+                        if let Ok(snapshot) = host_get_session_list() {
+                            let _ = self.replace_sessions(snapshot);
                         }
                         set_timeout(SIDEBAR_REFRESH_SECONDS);
                         host_load_sidebar_keymaps();
@@ -218,7 +241,7 @@ impl ZellijPlugin for State {
                             .find(|tab| tab.active)
                             .map(|tab| tab.display_area_columns)
                         {
-                            self.update_sidebar_width(columns);
+                            let _ = self.update_sidebar_width(columns);
                         }
                         should_render = true;
                     }
@@ -238,32 +261,41 @@ impl ZellijPlugin for State {
                     // tabs are indexed starting from 1 so we need to add 1
                     let active_tab_idx = active_tab_index + 1;
 
-                    should_render = self.active_tab_idx != active_tab_idx || self.tabs != tabs;
+                    let tabs_changed = self.active_tab_idx != active_tab_idx || self.tabs != tabs;
                     self.active_tab_idx = active_tab_idx;
                     if self.view == PluginView::Sidebar && self.permissions_granted {
-                        self.update_sidebar_width(tabs[active_tab_index].display_area_columns);
+                        let width_changed =
+                            self.update_sidebar_width(tabs[active_tab_index].display_area_columns);
+                        let rows_changed = self.update_current_session_tabs(&tabs);
+                        should_render = width_changed || rows_changed;
+                    } else {
+                        should_render = tabs_changed;
                     }
                     self.tabs = tabs;
                 } else {
                     eprintln!("Could not find active tab.");
+                    should_render = self.view == PluginView::Statusbar && self.tabs != tabs;
+                    self.tabs = tabs;
                 }
             }
             Event::PaneUpdate(pane_manifest) if self.view == PluginView::Sidebar => {
-                should_render = self.pane_manifest != pane_manifest;
                 self.pane_manifest = pane_manifest;
             }
             Event::SessionUpdate(live_sessions, resurrectable_sessions)
                 if self.view == PluginView::Sidebar =>
             {
-                self.replace_sessions(SessionListSnapshot {
+                let snapshot = SessionListSnapshot {
                     live_sessions,
                     resurrectable_sessions,
-                });
-                should_render = true;
+                };
+                should_render = self.replace_sessions(snapshot);
             }
             Event::Visible(visible) if self.view == PluginView::Sidebar => {
                 should_render = self.sidebar_visible != visible;
                 self.sidebar_visible = visible;
+                if visible && self.permissions_granted {
+                    should_render |= self.refresh_sessions();
+                }
             }
             Event::Key(key) if self.view == PluginView::Sidebar => {
                 should_render = self.handle_sidebar_key(key);
@@ -299,9 +331,8 @@ impl ZellijPlugin for State {
                     self.now = now;
                     set_timeout(1.0);
                 } else if self.permissions_granted {
-                    if let Ok(snapshot) = get_session_list() {
-                        should_render = self.sessions != snapshot;
-                        self.replace_sessions(snapshot);
+                    if self.sidebar_visible {
+                        should_render = self.refresh_sessions();
                     }
                     set_timeout(SIDEBAR_REFRESH_SECONDS);
                 }
@@ -347,6 +378,9 @@ impl ZellijPlugin for State {
             if self.sidebar_is_focused() {
                 host_move_focus_right();
             } else {
+                if self.permissions_granted {
+                    self.refresh_sessions();
+                }
                 host_show_self(false);
                 self.sidebar_visible = true;
             }
@@ -354,6 +388,9 @@ impl ZellijPlugin for State {
             host_hide_self();
             self.sidebar_visible = false;
         } else {
+            if self.permissions_granted {
+                self.refresh_sessions();
+            }
             host_show_self(true);
             self.sidebar_visible = true;
         }
@@ -393,13 +430,35 @@ impl State {
         self.sidebar_selected = move_selection(self.sidebar_selected, 0, self.sidebar_rows().len());
     }
 
-    fn replace_sessions(&mut self, sessions: SessionListSnapshot) {
+    fn replace_sessions(&mut self, mut sessions: SessionListSnapshot) -> bool {
+        let previous_rows = self.sidebar_rows();
+        let previous_selected = self.sidebar_selected;
+        let selected_session = previous_rows
+            .get(self.sidebar_selected)
+            .and_then(|row| match row {
+                SidebarRow::Live(session) => Some(session.name.clone()),
+                SidebarRow::NewWorkspace => None,
+            });
+        let new_workspace_selected = selected_session.is_none()
+            && matches!(
+                previous_rows.get(self.sidebar_selected),
+                Some(SidebarRow::NewWorkspace)
+            );
         let previous_current = self
             .sessions
             .live_sessions
             .iter()
             .find(|session| session.is_current_session)
             .map(|session| session.name.clone());
+        if !self.tabs.is_empty() {
+            if let Some(current_session) = sessions
+                .live_sessions
+                .iter_mut()
+                .find(|session| session.is_current_session)
+            {
+                current_session.tabs = self.tabs.clone();
+            }
+        }
         let next_current = sessions
             .live_sessions
             .iter()
@@ -407,17 +466,54 @@ impl State {
             .map(|session| session.name.clone());
 
         self.sessions = sessions;
+        let rows = self.sidebar_rows();
         if previous_current != next_current {
-            self.sidebar_selected = self
-                .sidebar_rows()
+            self.sidebar_selected = rows
                 .iter()
                 .position(|row| matches!(row, SidebarRow::Live(session) if session.current))
+                .unwrap_or_else(|| move_selection(self.sidebar_selected, 0, rows.len()));
+        } else if let Some(selected_session) = selected_session {
+            self.sidebar_selected = rows
+                .iter()
+                .position(
+                    |row| matches!(row, SidebarRow::Live(session) if session.name == selected_session),
+                )
                 .unwrap_or_else(|| {
-                    move_selection(self.sidebar_selected, 0, self.sidebar_rows().len())
+                    move_selection(self.sidebar_selected, 0, rows.len())
                 });
+        } else if new_workspace_selected {
+            self.sidebar_selected = rows.len().saturating_sub(1);
         } else {
             self.clamp_sidebar_selection();
         }
+        !same_rendered_rows(&previous_rows, &rows) || previous_selected != self.sidebar_selected
+    }
+
+    fn refresh_sessions(&mut self) -> bool {
+        let Ok(snapshot) = host_get_session_list() else {
+            return false;
+        };
+        if self.sessions == snapshot {
+            return false;
+        }
+        self.replace_sessions(snapshot)
+    }
+
+    fn update_current_session_tabs(&mut self, tabs: &[TabInfo]) -> bool {
+        let previous_rows = self.sidebar_rows();
+        let Some(current_session) = self
+            .sessions
+            .live_sessions
+            .iter_mut()
+            .find(|session| session.is_current_session)
+        else {
+            return false;
+        };
+        if current_session.tabs == tabs {
+            return false;
+        }
+        current_session.tabs = tabs.to_vec();
+        !same_rendered_rows(&previous_rows, &self.sidebar_rows())
     }
 
     fn sidebar_is_focused(&self) -> bool {
@@ -447,10 +543,10 @@ impl State {
             })
     }
 
-    fn update_sidebar_width(&mut self, display_area_columns: usize) {
+    fn update_sidebar_width(&mut self, display_area_columns: usize) -> bool {
         let wide = is_wide(display_area_columns);
         if self.sidebar_wide == Some(wide) {
-            return;
+            return false;
         }
         self.sidebar_wide = Some(wide);
 
@@ -463,28 +559,34 @@ impl State {
             host_hide_self();
             self.sidebar_visible = false;
         }
+        true
     }
 
     fn handle_sidebar_key(&mut self, key: KeyWithModifier) -> bool {
         match self.sidebar_keymaps.action(&key) {
             Some(SidebarAction::Down) => {
-                self.sidebar_selected =
-                    move_selection(self.sidebar_selected, 1, self.sidebar_rows().len());
-                true
+                let selected = move_selection(self.sidebar_selected, 1, self.sidebar_rows().len());
+                let changed = self.sidebar_selected != selected;
+                self.sidebar_selected = selected;
+                changed
             }
             Some(SidebarAction::Up) => {
-                self.sidebar_selected =
-                    move_selection(self.sidebar_selected, -1, self.sidebar_rows().len());
-                true
+                let selected = move_selection(self.sidebar_selected, -1, self.sidebar_rows().len());
+                let changed = self.sidebar_selected != selected;
+                self.sidebar_selected = selected;
+                changed
             }
-            Some(SidebarAction::Open) => self.activate_sidebar_selection(),
+            Some(SidebarAction::Open) => {
+                self.activate_sidebar_selection();
+                false
+            }
             Some(SidebarAction::NewWorkspace) => {
                 self.open_workspace_picker();
-                true
+                false
             }
             Some(SidebarAction::Cancel) => {
                 self.leave_sidebar();
-                true
+                false
             }
             None => false,
         }
@@ -498,26 +600,31 @@ impl State {
                 else {
                     return false;
                 };
-                self.sidebar_selected = self.sidebar_first_row + visible_index;
-                self.activate_sidebar_selection()
+                let selected = self.sidebar_first_row + visible_index;
+                let changed = self.sidebar_selected != selected;
+                self.sidebar_selected = selected;
+                self.activate_sidebar_selection();
+                changed
             }
             Mouse::ScrollUp(_) => {
-                self.sidebar_selected =
-                    move_selection(self.sidebar_selected, -1, self.sidebar_rows().len());
-                true
+                let selected = move_selection(self.sidebar_selected, -1, self.sidebar_rows().len());
+                let changed = self.sidebar_selected != selected;
+                self.sidebar_selected = selected;
+                changed
             }
             Mouse::ScrollDown(_) => {
-                self.sidebar_selected =
-                    move_selection(self.sidebar_selected, 1, self.sidebar_rows().len());
-                true
+                let selected = move_selection(self.sidebar_selected, 1, self.sidebar_rows().len());
+                let changed = self.sidebar_selected != selected;
+                self.sidebar_selected = selected;
+                changed
             }
             _ => false,
         }
     }
 
-    fn activate_sidebar_selection(&mut self) -> bool {
+    fn activate_sidebar_selection(&mut self) {
         let Some(row) = self.sidebar_rows().get(self.sidebar_selected).cloned() else {
-            return false;
+            return;
         };
 
         match row {
@@ -530,7 +637,6 @@ impl State {
             }
             SidebarRow::NewWorkspace => self.open_workspace_picker(),
         }
-        true
     }
 
     fn open_workspace_picker(&self) {
@@ -641,15 +747,16 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, path::Path, time::Duration};
+    use std::{collections::HashMap, path::Path, str::FromStr, time::Duration};
 
     use zellij_tile::prelude::{
-        EventType, PaneId, PaneInfo, PaneManifest, PermissionType, SessionInfo,
+        EventType, KeyWithModifier, PaneId, PaneInfo, PaneManifest, PermissionType, SessionInfo,
         SessionListSnapshot, TabInfo,
     };
 
     use super::{
-        State, open_workspace_picker_with, plugin_permissions, sidebar_events, statusbar_events,
+        PluginView, SidebarRow, State, open_workspace_picker_with, plugin_permissions,
+        sidebar_events, statusbar_events,
     };
 
     fn plugin(id: u32) -> PaneInfo {
@@ -742,13 +849,13 @@ mod tests {
     #[test]
     fn session_switch_selects_the_new_current_workspace() {
         let mut state = State::default();
-        state.replace_sessions(SessionListSnapshot {
+        let _ = state.replace_sessions(SessionListSnapshot {
             live_sessions: vec![session("first", 1, true), session("second", 2, false)],
             ..SessionListSnapshot::default()
         });
         assert_eq!(state.sidebar_selected, 0);
 
-        state.replace_sessions(SessionListSnapshot {
+        let _ = state.replace_sessions(SessionListSnapshot {
             live_sessions: vec![session("first", 1, false), session("second", 2, true)],
             ..SessionListSnapshot::default()
         });
@@ -762,11 +869,185 @@ mod tests {
             ..SessionListSnapshot::default()
         };
         let mut state = State::default();
-        state.replace_sessions(snapshot.clone());
+        let _ = state.replace_sessions(snapshot.clone());
         state.sidebar_selected = 1;
 
-        state.replace_sessions(snapshot);
+        let _ = state.replace_sessions(snapshot);
 
         assert_eq!(state.sidebar_selected, 1);
+    }
+
+    #[test]
+    fn refresh_preserves_the_selected_workspace_when_rows_shift() {
+        let mut state = State::default();
+        let _ = state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![
+                session("first", 1, true),
+                session("second", 2, false),
+                session("third", 3, false),
+            ],
+            ..SessionListSnapshot::default()
+        });
+        state.sidebar_selected = 2;
+
+        let _ = state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true), session("third", 3, false)],
+            ..SessionListSnapshot::default()
+        });
+
+        assert_eq!(state.sidebar_selected, 1);
+    }
+
+    #[test]
+    fn refresh_keeps_new_workspace_selected_at_the_end() {
+        let mut state = State::default();
+        let _ = state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true)],
+            ..SessionListSnapshot::default()
+        });
+        state.sidebar_selected = 1;
+
+        let _ = state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true), session("second", 2, false)],
+            ..SessionListSnapshot::default()
+        });
+
+        assert_eq!(state.sidebar_selected, 2);
+    }
+
+    #[test]
+    fn unchanged_and_nonvisual_session_updates_do_not_redraw_the_sidebar() {
+        let snapshot = SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true)],
+            ..SessionListSnapshot::default()
+        };
+        let mut state = State {
+            view: PluginView::Sidebar,
+            sessions: snapshot.clone(),
+            ..State::default()
+        };
+
+        assert!(!state.replace_sessions(snapshot));
+
+        let mut nonvisual_update = session("first", 1, true);
+        nonvisual_update.connected_clients = 2;
+        assert!(!state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![nonvisual_update],
+            ..SessionListSnapshot::default()
+        }));
+        assert_eq!(state.sessions.live_sessions[0].connected_clients, 2);
+    }
+
+    #[test]
+    fn navigation_at_a_boundary_does_not_redraw_the_sidebar() {
+        let mut state = State::default();
+
+        assert!(!state.handle_sidebar_key(KeyWithModifier::from_str("k").unwrap()));
+    }
+
+    #[test]
+    fn sidebar_redraws_only_when_responsive_width_changes() {
+        let tabs = [TabInfo {
+            name: "editor".into(),
+            active: true,
+            display_area_columns: 120,
+            ..TabInfo::default()
+        }];
+        let mut state = State {
+            sidebar_wide: Some(true),
+            sidebar_visible: true,
+            ..State::default()
+        };
+
+        assert!(!state.update_sidebar_width(tabs[0].display_area_columns));
+        assert!(state.update_sidebar_width(80));
+    }
+
+    #[test]
+    fn current_session_tab_events_update_sidebar_attention_immediately() {
+        let tabs = vec![TabInfo {
+            active: true,
+            display_area_columns: 120,
+            ..TabInfo::default()
+        }];
+        let mut current = session("first", 1, true);
+        current.tabs = tabs.clone();
+        let mut state = State {
+            view: PluginView::Sidebar,
+            sessions: SessionListSnapshot {
+                live_sessions: vec![current],
+                ..SessionListSnapshot::default()
+            },
+            tabs: tabs.clone(),
+            active_tab_idx: 1,
+            sidebar_wide: Some(true),
+            sidebar_visible: true,
+            permissions_granted: true,
+            ..State::default()
+        };
+        let attention_tabs = vec![TabInfo {
+            has_bell_notification: true,
+            ..tabs[0].clone()
+        }];
+
+        assert!(state.update_current_session_tabs(&attention_tabs));
+        assert!(state.sessions.live_sessions[0].tabs[0].has_bell_notification);
+    }
+
+    #[test]
+    fn stale_snapshot_does_not_erase_current_session_attention() {
+        let current_tabs = vec![TabInfo {
+            active: true,
+            has_bell_notification: true,
+            ..TabInfo::default()
+        }];
+        let mut current = session("first", 1, true);
+        current.tabs = current_tabs.clone();
+        let mut state = State {
+            sessions: SessionListSnapshot {
+                live_sessions: vec![current],
+                ..SessionListSnapshot::default()
+            },
+            tabs: current_tabs,
+            ..State::default()
+        };
+        let mut stale_current = session("first", 1, true);
+        stale_current.tabs = vec![TabInfo {
+            active: true,
+            has_bell_notification: false,
+            ..TabInfo::default()
+        }];
+
+        assert!(!state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![stale_current],
+            ..SessionListSnapshot::default()
+        }));
+        assert!(state.sessions.live_sessions[0].tabs[0].has_bell_notification);
+    }
+
+    #[test]
+    fn peer_session_attention_redraws_the_sidebar_notification() {
+        let mut peer = session("second", 2, false);
+        peer.tabs = vec![TabInfo {
+            active: true,
+            ..TabInfo::default()
+        }];
+        let mut state = State {
+            sessions: SessionListSnapshot {
+                live_sessions: vec![session("first", 1, true), peer.clone()],
+                ..SessionListSnapshot::default()
+            },
+            ..State::default()
+        };
+        peer.tabs[0].has_bell_notification = true;
+
+        assert!(state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true), peer],
+            ..SessionListSnapshot::default()
+        }));
+        let SidebarRow::Live(peer_row) = &state.sidebar_rows()[1] else {
+            panic!("expected peer session row");
+        };
+        assert_eq!(peer_row.unread_tabs, 1);
     }
 }
