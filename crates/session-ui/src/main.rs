@@ -55,6 +55,7 @@ struct State {
     sidebar_selected: usize,
     sidebar_first_row: usize,
     sidebar_visible_rows: usize,
+    sidebar_rendered_rows: Vec<SidebarRow>,
     sidebar_visible: bool,
     sidebar_wide: Option<bool>,
     permissions_granted: bool,
@@ -400,6 +401,9 @@ impl ZellijPlugin for State {
     fn render(&mut self, rows: usize, cols: usize) {
         if self.view == PluginView::Sidebar {
             if let Some(message) = &self.permission_error {
+                self.sidebar_first_row = 0;
+                self.sidebar_visible_rows = 0;
+                self.sidebar_rendered_rows.clear();
                 let width = unicode_width::UnicodeWidthStr::width(message.as_str());
                 let line = format!("{}{}", message, " ".repeat(cols.saturating_sub(width)));
                 let palette = color::palette_from_styling(self.mode_info.style.colors);
@@ -413,6 +417,7 @@ impl ZellijPlugin for State {
                 sidebar::render(&dashboard_rows, self.sidebar_selected, rows, cols, palette);
             self.sidebar_first_row = first_row;
             self.sidebar_visible_rows = rows.saturating_sub(2).min(dashboard_rows.len());
+            self.sidebar_rendered_rows = dashboard_rows;
             print!("{rendered}");
             return;
         }
@@ -595,15 +600,12 @@ impl State {
     fn handle_sidebar_mouse(&mut self, event: Mouse) -> bool {
         match event {
             Mouse::LeftClick(screen_line, _) => {
-                let Some(visible_index) =
-                    row_for_screen_line(screen_line, self.sidebar_visible_rows)
-                else {
+                let Some((selected, row)) = self.rendered_sidebar_row(screen_line) else {
                     return false;
                 };
-                let selected = self.sidebar_first_row + visible_index;
                 let changed = self.sidebar_selected != selected;
                 self.sidebar_selected = selected;
-                self.activate_sidebar_selection();
+                self.activate_sidebar_row(row);
                 changed
             }
             Mouse::ScrollUp(_) => {
@@ -627,6 +629,19 @@ impl State {
             return;
         };
 
+        self.activate_sidebar_row(row);
+    }
+
+    fn rendered_sidebar_row(&self, screen_line: isize) -> Option<(usize, SidebarRow)> {
+        let visible_index = row_for_screen_line(screen_line, self.sidebar_visible_rows)?;
+        let selected = self.sidebar_first_row + visible_index;
+        self.sidebar_rendered_rows
+            .get(selected)
+            .cloned()
+            .map(|row| (selected, row))
+    }
+
+    fn activate_sidebar_row(&self, row: SidebarRow) {
         match row {
             SidebarRow::Live(session) => {
                 host_switch_session(
@@ -750,13 +765,13 @@ mod tests {
     use std::{collections::HashMap, path::Path, str::FromStr, time::Duration};
 
     use zellij_tile::prelude::{
-        EventType, KeyWithModifier, PaneId, PaneInfo, PaneManifest, PermissionType, SessionInfo,
-        SessionListSnapshot, TabInfo,
+        ClientId, EventType, KeyWithModifier, PaneId, PaneInfo, PaneManifest, PermissionType,
+        SessionInfo, SessionListSnapshot, TabInfo,
     };
 
     use super::{
-        PluginView, SidebarRow, State, open_workspace_picker_with, plugin_permissions,
-        sidebar_events, statusbar_events,
+        PluginView, SidebarRow, State, dashboard_rows, open_workspace_picker_with,
+        plugin_permissions, sidebar_events, statusbar_events,
     };
 
     fn plugin(id: u32) -> PaneInfo {
@@ -1049,5 +1064,30 @@ mod tests {
             panic!("expected peer session row");
         };
         assert_eq!(peer_row.unread_tabs, 1);
+    }
+
+    #[test]
+    fn mouse_click_uses_the_row_identity_from_the_last_render() {
+        let rendered_sessions = SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true), session("second", 2, false)],
+            ..SessionListSnapshot::default()
+        };
+        let mut state = State {
+            sessions: rendered_sessions.clone(),
+            sidebar_rendered_rows: dashboard_rows(&rendered_sessions, ClientId::default()),
+            sidebar_visible_rows: 3,
+            ..State::default()
+        };
+
+        let _ = state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("first", 1, true)],
+            ..SessionListSnapshot::default()
+        });
+
+        assert!(matches!(state.sidebar_rows()[1], SidebarRow::NewWorkspace));
+        assert!(matches!(
+            state.rendered_sidebar_row(2),
+            Some((1, SidebarRow::Live(ref session))) if session.name == "second"
+        ));
     }
 }
