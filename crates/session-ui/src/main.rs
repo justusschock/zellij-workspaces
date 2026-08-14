@@ -56,6 +56,7 @@ struct State {
     sidebar_first_row: usize,
     sidebar_visible_rows: usize,
     sidebar_rendered_rows: Vec<SidebarRow>,
+    sidebar_session_order: Vec<String>,
     sidebar_visible: bool,
     sidebar_wide: Option<bool>,
     permissions_granted: bool,
@@ -410,7 +411,7 @@ impl ZellijPlugin for State {
                 print!("{}", style!(palette.red, palette.bg).bold().paint(line));
                 return;
             }
-            let dashboard_rows = dashboard_rows(&self.sessions, self.client_id);
+            let dashboard_rows = self.sidebar_rows();
             self.sidebar_selected = move_selection(self.sidebar_selected, 0, dashboard_rows.len());
             let palette = color::palette_from_styling(self.mode_info.style.colors);
             let (rendered, first_row) =
@@ -428,7 +429,19 @@ impl ZellijPlugin for State {
 
 impl State {
     fn sidebar_rows(&self) -> Vec<SidebarRow> {
-        dashboard_rows(&self.sessions, self.client_id)
+        let mut rows = dashboard_rows(&self.sessions, self.client_id);
+        if self.sidebar_session_order.is_empty() {
+            return rows;
+        }
+        rows.sort_by_key(|row| match row {
+            SidebarRow::Live(session) => self
+                .sidebar_session_order
+                .iter()
+                .position(|name| name == &session.name)
+                .unwrap_or(usize::MAX),
+            SidebarRow::NewWorkspace => usize::MAX,
+        });
+        rows
     }
 
     fn clamp_sidebar_selection(&mut self) {
@@ -470,6 +483,7 @@ impl State {
             .find(|session| session.is_current_session)
             .map(|session| session.name.clone());
 
+        self.remember_sidebar_session_order(&sessions);
         self.sessions = sessions;
         let rows = self.sidebar_rows();
         if previous_current != next_current {
@@ -492,6 +506,27 @@ impl State {
             self.clamp_sidebar_selection();
         }
         !same_rendered_rows(&previous_rows, &rows) || previous_selected != self.sidebar_selected
+    }
+
+    fn remember_sidebar_session_order(&mut self, sessions: &SessionListSnapshot) {
+        let new_session_names = dashboard_rows(sessions, self.client_id)
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Live(session)
+                    if !self.sidebar_session_order.contains(&session.name) =>
+                {
+                    Some(session.name)
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        if new_session_names.is_empty() {
+            return;
+        }
+
+        let previous_order = std::mem::take(&mut self.sidebar_session_order);
+        self.sidebar_session_order = new_session_names;
+        self.sidebar_session_order.extend(previous_order);
     }
 
     fn refresh_sessions(&mut self) -> bool {
@@ -1089,5 +1124,38 @@ mod tests {
             state.rendered_sidebar_row(2),
             Some((1, SidebarRow::Live(ref session))) if session.name == "second"
         ));
+    }
+
+    #[test]
+    fn refresh_preserves_order_when_creation_ages_cross() {
+        let mut state = State::default();
+        let _ = state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("nunc", 100, true), session("databases", 101, false)],
+            ..SessionListSnapshot::default()
+        });
+        let initial_names = state
+            .sidebar_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Live(session) => Some(session.name),
+                SidebarRow::NewWorkspace => None,
+            })
+            .collect::<Vec<_>>();
+
+        let _ = state.replace_sessions(SessionListSnapshot {
+            live_sessions: vec![session("nunc", 101, true), session("databases", 100, false)],
+            ..SessionListSnapshot::default()
+        });
+        let refreshed_names = state
+            .sidebar_rows()
+            .into_iter()
+            .filter_map(|row| match row {
+                SidebarRow::Live(session) => Some(session.name),
+                SidebarRow::NewWorkspace => None,
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(initial_names, ["nunc", "databases"]);
+        assert_eq!(refreshed_names, initial_names);
     }
 }
